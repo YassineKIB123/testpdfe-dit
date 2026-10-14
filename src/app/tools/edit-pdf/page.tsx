@@ -38,13 +38,7 @@ import {
 } from "lucide-react";
 
 export type PdfFontFamily = "sans" | "serif" | "mono";
-export type MaskBgMode =
-  | "auto"
-  | "white"
-  | "cream"
-  | "black"
-  | "transparent"
-  | "custom";
+export type MaskBgMode = "auto" | "white" | "cream" | "black" | "transparent" | "custom";
 export type TextAlignMode = "left" | "center" | "right";
 
 export interface TextBlockItem {
@@ -54,17 +48,18 @@ export interface TextBlockItem {
   currentText: string;
   isNew: boolean;
   isWhiteoutOnly?: boolean;
-  // Original PDF coordinates (in % of page width/height, top-left origin) so moved blocks still mask original glyphs
+  // Original PDF coordinates in percentages (top-left origin, 0–100)
   origXPercent: number;
   origYPercent: number;
   origWidthPercent: number;
   origHeightPercent: number;
-  // Current interactive coordinates (in % of page width/height, top-left origin)
+  // Current interactive coordinates (top-left origin, 0–100)
   xPercent: number;
   yPercent: number;
   widthPercent: number;
   heightPercent: number;
-  // Typography & style properties
+  // Baseline position from top in points (for accurate baseline alignment)
+  baselinePt: number;
   fontSizePt: number;
   fontFamily: PdfFontFamily;
   color: string;
@@ -104,11 +99,16 @@ function rgbToHex(r: number, g: number, b: number): string {
   );
 }
 
-/**
- * Samples the rendered PDF canvas around and inside a text bounding box to detect:
- * 1. The exact background paper/table-cell color (`autoBgHex`) from perimeter pixels
- * 2. The original text ink color (`autoFgHex`) from highest-contrast interior pixels
- */
+function dataUrlToBytes(dataUrl: string): Uint8Array {
+  const base64 = dataUrl.split(",")[1];
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
 function sampleCanvasColorsForBox(
   ctx: CanvasRenderingContext2D,
   canvasW: number,
@@ -134,7 +134,6 @@ function sampleCanvasColorsForBox(
     const edgeG: number[] = [];
     const edgeB: number[] = [];
 
-    // Sample top & bottom perimeter rows to determine background color
     for (let x = 0; x < sw; x += 2) {
       for (const y of [0, 1, sh - 2, sh - 1]) {
         if (y >= 0 && y < sh) {
@@ -159,7 +158,6 @@ function sampleCanvasColorsForBox(
       bgB = edgeB[mid];
     }
 
-    // Sample interior pixels with highest contrast from background to detect ink color
     let bestFgR = 15;
     let bestFgG = 23;
     let bestFgB = 42;
@@ -172,7 +170,7 @@ function sampleCanvasColorsForBox(
         const g = imgData[idx + 1];
         const b = imgData[idx + 2];
         const dist = Math.abs(r - bgR) + Math.abs(g - bgG) + Math.abs(b - bgB);
-        if (dist > maxDist && dist > 85) {
+        if (dist > maxDist && dist > 80) {
           maxDist = dist;
           bestFgR = r;
           bestFgG = g;
@@ -190,9 +188,6 @@ function sampleCanvasColorsForBox(
   }
 }
 
-/**
- * Resolves the effective background fill hex string (or "transparent") for a block.
- */
 function resolveMaskHex(block: TextBlockItem): string {
   switch (block.maskBg) {
     case "transparent":
@@ -221,23 +216,23 @@ export default function EditPdfPage() {
   const [textBlocks, setTextBlocks] = useState<TextBlockItem[]>([]);
   const [selectedBlockId, setSelectedBlockId] = useState<string | null>(null);
 
-  // Undo / Redo stacks
+  // Undo / Redo
   const [historyPast, setHistoryPast] = useState<TextBlockItem[][]>([]);
   const [historyFuture, setHistoryFuture] = useState<TextBlockItem[][]>([]);
 
-  // Find & Replace Bar
+  // Find & Replace
   const [showFindReplace, setShowFindReplace] = useState(false);
   const [findQuery, setFindQuery] = useState("");
   const [replaceQuery, setReplaceQuery] = useState("");
   const [caseSensitiveFind, setCaseSensitiveFind] = useState(false);
 
-  // Viewport Zoom & Preview Mode
+  // Viewport & Zoom
   const [zoomPercent, setZoomPercent] = useState<number>(100);
   const [previewCleanMode, setPreviewCleanMode] = useState<boolean>(false);
-  const [pageBaseSizePt, setPageBaseSizePt] = useState<{
-    width: number;
-    height: number;
-  }>({ width: 612, height: 792 });
+  const [pageBaseSizePt, setPageBaseSizePt] = useState<{ width: number; height: number }>({
+    width: 612,
+    height: 792,
+  });
   const [containerCssWidth, setContainerCssWidth] = useState<number>(612);
 
   const [isRenderingPage, setIsRenderingPage] = useState(false);
@@ -245,14 +240,11 @@ export default function EditPdfPage() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
 
-  // Ref guards to avoid duplicate extraction in React 18/19 StrictMode
   const extractedPagesRef = useRef<Set<number>>(new Set());
   const colorSampledPagesRef = useRef<Set<number>>(new Set());
 
-  // Pointer Dragging & Resizing
-  const [interactionMode, setInteractionMode] = useState<
-    "none" | "drag" | "resize"
-  >("none");
+  // Dragging & Resizing
+  const [interactionMode, setInteractionMode] = useState<"none" | "drag" | "resize">("none");
   const interactionRef = useRef<{
     id: string;
     clientX: number;
@@ -267,7 +259,6 @@ export default function EditPdfPage() {
   const pageContainerRef = useRef<HTMLDivElement>(null);
   const pdfCanvasRef = useRef<HTMLCanvasElement>(null);
 
-  // Track CSS width of rendered page container so 1pt font size scales accurately at any zoom/screen width
   useEffect(() => {
     const el = pageContainerRef.current;
     if (!el || typeof ResizeObserver === "undefined") return;
@@ -308,7 +299,9 @@ export default function EditPdfPage() {
   }, [textBlocks]);
 
   /**
-   * Extracts editable text lines from a single PDF page and detects font family, bold, italic, and coordinates.
+   * Deterministic 2-Pass Line Extraction:
+   * Pass 1: Maps user-space coordinates accurately via viewport.convertToViewportPoint.
+   * Pass 2: Groups into baseline bands and strictly sorts left-to-right to prevent scrambling.
    */
   const extractTextBlocksFromPage = useCallback(
     async (
@@ -331,6 +324,7 @@ export default function EditPdfPage() {
       interface RawFragment {
         text: string;
         x: number;
+        baselineY: number;
         yTop: number;
         w: number;
         h: number;
@@ -344,61 +338,51 @@ export default function EditPdfPage() {
 
       for (const item of rawItems) {
         if (!item.str || !item.str.trim()) continue;
-        const tx = item.transform[4];
-        const ty = item.transform[5];
-        const fontSize = Math.max(
-          7,
-          Math.round(Math.hypot(item.transform[0], item.transform[1]) * 10) / 10
-        );
-        const itemW = item.width || item.str.length * (fontSize * 0.52);
-        const itemH = Math.max(item.height || fontSize * 1.14, fontSize * 1.12);
-        // Convert PDF bottom-left baseline Y to top-left box Y
-        const yTop = pageH - ty - fontSize * 0.84;
 
-        // Inspect PDF font metadata from styles and commonObjs
+        // Viewport coordinate transformation (Top-Left origin)
+        const [vx, vy] = baseViewport.convertToViewportPoint(item.transform[4], item.transform[5]);
+
+        const fontScaleX = Math.hypot(item.transform[0], item.transform[1]);
+        const fontScaleY = Math.hypot(item.transform[2], item.transform[3]);
+        const fontSize = Math.max(7, Math.round(fontScaleY || fontScaleX || 12));
+
+        const itemW = item.width || item.str.length * (fontSize * 0.52);
+        const ascent = fontSize * 0.82;
+        const descent = fontSize * 0.28;
+        const itemH = ascent + descent;
+        const yTop = vy - ascent;
+
         const styleObj = stylesDict[item.fontName] || {};
         let rawFontMeta = `${item.fontName || ""} ${styleObj.fontFamily || ""}`;
         try {
-          if (
-            page.commonObjs &&
-            typeof page.commonObjs.has === "function" &&
-            page.commonObjs.has(item.fontName)
-          ) {
+          if (page.commonObjs?.has?.(item.fontName)) {
             const fObj = page.commonObjs.get(item.fontName);
             if (fObj?.name) rawFontMeta += ` ${fObj.name}`;
           }
-        } catch {
-          // Ignore if commonObjs is not populated yet
-        }
+        } catch {}
 
         const lowerFont = rawFontMeta.toLowerCase();
         let fontFamily: PdfFontFamily = "sans";
-        if (
-          /mono|courier|consolas|menlo|fixed|typewriter|code/.test(lowerFont)
-        ) {
+        if (/mono|courier|consolas|menlo|fixed|typewriter|code/.test(lowerFont)) {
           fontFamily = "mono";
         } else if (
-          /serif|times|georgia|garamond|cambria|palatino|mincho|baskerville/.test(
-            lowerFont
-          ) &&
+          /serif|times|georgia|garamond|cambria|palatino|mincho|baskerville/.test(lowerFont) &&
           !/sans/.test(lowerFont)
         ) {
           fontFamily = "serif";
         }
 
-        const isBold =
-          /bold|black|heavy|demi|semibold|extrabold|-bd|700|800|900/.test(
-            lowerFont
-          );
+        const isBold = /bold|black|heavy|demi|semibold|extrabold|-bd|700|800|900/.test(lowerFont);
         const isItalic =
           /italic|oblique|slanted|-it/.test(lowerFont) ||
           Math.abs(item.transform[2]) > 0.08 * fontSize;
 
         fragments.push({
           text: item.str,
-          x: tx,
+          x: vx,
+          baselineY: vy,
           yTop,
-          w: Math.max(itemW, fontSize * 0.6),
+          w: Math.max(itemW, fontSize * 0.5),
           h: itemH,
           fontSize,
           fontFamily,
@@ -407,40 +391,57 @@ export default function EditPdfPage() {
         });
       }
 
-      // Sort top-to-bottom, then left-to-right so multi-column PDFs and tables merge accurately
-      fragments.sort((a, b) => {
-        if (Math.abs(a.yTop - b.yTop) > Math.min(a.fontSize, b.fontSize) * 0.42) {
-          return a.yTop - b.yTop;
-        }
-        return a.x - b.x;
-      });
+      // Step A: Sort strictly by baseline Y (transitive, no cycles)
+      fragments.sort((a, b) => a.baselineY - b.baselineY);
 
-      const mergedLines: RawFragment[] = [];
+      // Step B: Cluster fragments that share a line baseline
+      const lines: RawFragment[][] = [];
       for (const frag of fragments) {
-        const last = mergedLines[mergedLines.length - 1];
-        const sameBaseline =
-          last &&
-          Math.abs(last.yTop - frag.yTop) <
-            Math.min(last.fontSize, frag.fontSize) * 0.42;
-        const gap = last ? frag.x - (last.x + last.w) : Infinity;
-        // Keep separate table columns distinct while merging words in the same phrase/sentence
-        const isAdjacentPhrase =
-          last &&
-          gap >= -frag.fontSize * 0.3 &&
-          gap < Math.max(last.fontSize, frag.fontSize) * 1.75 &&
-          Math.abs(last.fontSize - frag.fontSize) <= 2;
-
-        if (sameBaseline && isAdjacentPhrase) {
-          const needsSpace =
-            gap > frag.fontSize * 0.16 &&
-            !last.text.endsWith(" ") &&
-            !frag.text.startsWith(" ");
-          last.text += (needsSpace ? " " : "") + frag.text;
-          last.w = Math.max(last.w, frag.x + frag.w - last.x);
-          last.h = Math.max(last.h, frag.h);
-        } else {
-          mergedLines.push({ ...frag });
+        let placed = false;
+        for (const line of lines) {
+          const rep = line[0];
+          const fontTolerance = Math.min(rep.fontSize, frag.fontSize) * 0.35;
+          if (Math.abs(rep.baselineY - frag.baselineY) <= Math.max(3, fontTolerance)) {
+            line.push(frag);
+            placed = true;
+            break;
+          }
         }
+        if (!placed) {
+          lines.push([frag]);
+        }
+      }
+
+      // Step C: Sort lines top-to-bottom
+      lines.sort((l1, l2) => l1[0].baselineY - l2[0].baselineY);
+
+      // Step D: Sort words strictly left-to-right within each line and merge phrases
+      const mergedLines: RawFragment[] = [];
+      for (const line of lines) {
+        line.sort((a, b) => a.x - b.x);
+
+        let current = { ...line[0] };
+        for (let i = 1; i < line.length; i++) {
+          const next = line[i];
+          const gap = next.x - (current.x + current.w);
+          const maxGap = Math.max(current.fontSize, next.fontSize) * 2.2;
+
+          if (gap >= -current.fontSize * 0.4 && gap < maxGap) {
+            const needsSpace =
+              gap > current.fontSize * 0.12 &&
+              !current.text.endsWith(" ") &&
+              !next.text.startsWith(" ");
+            current.text += (needsSpace ? " " : "") + next.text;
+            current.w = next.x + next.w - current.x;
+            current.h = Math.max(current.h, next.h);
+            current.yTop = Math.min(current.yTop, next.yTop);
+            current.fontSize = Math.max(current.fontSize, next.fontSize);
+          } else {
+            mergedLines.push(current);
+            current = { ...next };
+          }
+        }
+        mergedLines.push(current);
       }
 
       return mergedLines.map((ln, idx) => {
@@ -463,11 +464,8 @@ export default function EditPdfPage() {
 
         const xPct = Math.max(0, Math.min(96, (ln.x / pageW) * 100));
         const yPct = Math.max(0, Math.min(96, (ln.yTop / pageH) * 100));
-        const wPct = Math.max(
-          2.5,
-          Math.min(100 - xPct, ((ln.w + 4) / pageW) * 100)
-        );
-        const hPct = Math.max(1.8, ((ln.h + 2) / pageH) * 100);
+        const wPct = Math.max(2, Math.min(100 - xPct, ((ln.w + 4) / pageW) * 100));
+        const hPct = Math.max(1.5, ((ln.h + 2) / pageH) * 100);
 
         return {
           id: `p${pageNum}_txt_${idx}`,
@@ -483,7 +481,8 @@ export default function EditPdfPage() {
           yPercent: yPct,
           widthPercent: wPct,
           heightPercent: hPct,
-          fontSizePt: Math.round(ln.fontSize),
+          baselinePt: ln.baselineY,
+          fontSizePt: ln.fontSize,
           fontFamily: ln.fontFamily,
           color: autoFgHex,
           isBold: ln.isBold,
@@ -520,42 +519,32 @@ export default function EditPdfPage() {
       setPdfDocProxy(pdf);
       setTotalPages(pdf.numPages);
 
-      // Background pre-index pages 2..N so document-wide Find & Replace works immediately
+      // Pre-extract other pages for global Find & Replace
       if (pdf.numPages > 1) {
         (async () => {
-          const allOtherBlocks: TextBlockItem[] = [];
+          const otherBlocks: TextBlockItem[] = [];
           for (let p = 2; p <= Math.min(pdf.numPages, 50); p++) {
             if (extractedPagesRef.current.has(p)) continue;
             extractedPagesRef.current.add(p);
             try {
               const pBlocks = await extractTextBlocksFromPage(pdf, p);
-              allOtherBlocks.push(...pBlocks);
-            } catch {
-              // Ignore single-page extraction error
-            }
+              otherBlocks.push(...pBlocks);
+            } catch {}
           }
-          if (allOtherBlocks.length > 0) {
+          if (otherBlocks.length > 0) {
             setTextBlocks((prev) => {
               const existingPages = new Set(prev.map((b) => b.pageNumber));
-              const filtered = allOtherBlocks.filter(
-                (b) => !existingPages.has(b.pageNumber)
-              );
-              return [...prev, ...filtered];
+              return [...prev, ...otherBlocks.filter((b) => !existingPages.has(b.pageNumber))];
             });
           }
         })();
       }
     } catch (err: unknown) {
-      const msg =
-        err instanceof Error ? err.message : "Failed to load PDF document.";
-      setErrorMessage(msg);
+      setErrorMessage(err instanceof Error ? err.message : "Failed to load PDF document.");
       setFile(null);
     }
   };
 
-  /**
-   * Renders the active PDF page to the canvas and samples exact background/ink colors for all lines on the page.
-   */
   const renderAndExtractPage = useCallback(
     async (pageNum: number) => {
       if (!pdfDocProxy || !pdfCanvasRef.current) return;
@@ -596,7 +585,6 @@ export default function EditPdfPage() {
             ...pageBlocks,
           ]);
         } else if (!colorSampledPagesRef.current.has(pageNum)) {
-          // Page was pre-indexed in background without canvas colors; sample exact colors now
           colorSampledPagesRef.current.add(pageNum);
           setTextBlocks((old) =>
             old.map((b) => {
@@ -610,12 +598,11 @@ export default function EditPdfPage() {
                 (b.origWidthPercent / 100) * canvas.width,
                 (b.origHeightPercent / 100) * canvas.height
               );
-              const isUnmodifiedColor = b.color === "#0f172a";
               return {
                 ...b,
                 autoBgHex: sampled.autoBgHex,
                 customMaskHex: sampled.autoBgHex,
-                color: isUnmodifiedColor ? sampled.autoFgHex : b.color,
+                color: b.color === "#0f172a" ? sampled.autoFgHex : b.color,
               };
             })
           );
@@ -636,11 +623,7 @@ export default function EditPdfPage() {
   }, [pdfDocProxy, currentPage, renderAndExtractPage]);
 
   const handleUpdateBlock = useCallback(
-    (
-      id: string,
-      patch: Partial<TextBlockItem>,
-      recordHistory: boolean = true
-    ) => {
+    (id: string, patch: Partial<TextBlockItem>, recordHistory = false) => {
       setTextBlocks((prev) => {
         if (recordHistory) {
           pushUndoSnapshot(prev);
@@ -658,17 +641,18 @@ export default function EditPdfPage() {
       id: newId,
       pageNumber: currentPage,
       originalText: "",
-      currentText: "New Text — Click to Edit",
+      currentText: "New Text",
       isNew: true,
-      origXPercent: 25,
-      origYPercent: 25,
-      origWidthPercent: 32,
+      origXPercent: 20,
+      origYPercent: 20,
+      origWidthPercent: 30,
       origHeightPercent: 4,
-      xPercent: 25,
-      yPercent: 25,
-      widthPercent: 32,
+      xPercent: 20,
+      yPercent: 20,
+      widthPercent: 30,
       heightPercent: 4,
-      fontSizePt: 13,
+      baselinePt: (20 / 100) * pageBaseSizePt.height + 12,
+      fontSizePt: 14,
       fontFamily: "sans",
       color: "#0f172a",
       isBold: false,
@@ -693,14 +677,15 @@ export default function EditPdfPage() {
       currentText: "",
       isNew: true,
       isWhiteoutOnly: true,
-      origXPercent: 30,
-      origYPercent: 38,
-      origWidthPercent: 28,
+      origXPercent: 25,
+      origYPercent: 30,
+      origWidthPercent: 25,
       origHeightPercent: 5,
-      xPercent: 30,
-      yPercent: 38,
-      widthPercent: 28,
+      xPercent: 25,
+      yPercent: 30,
+      widthPercent: 25,
       heightPercent: 5,
+      baselinePt: (30 / 100) * pageBaseSizePt.height + 12,
       fontSizePt: 12,
       fontFamily: "sans",
       color: "#0f172a",
@@ -749,7 +734,6 @@ export default function EditPdfPage() {
     );
   };
 
-  // Find & Replace across current page or entire PDF
   const matchingBlocks = findQuery.trim()
     ? textBlocks.filter((b) => {
         if (b.isWhiteoutOnly || !b.currentText) return false;
@@ -764,49 +748,41 @@ export default function EditPdfPage() {
     const escaped = findQuery.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const regex = new RegExp(escaped, caseSensitiveFind ? "g" : "gi");
 
-    let replacedCount = 0;
+    let count = 0;
     pushUndoSnapshot(textBlocks);
     setTextBlocks((prev) =>
       prev.map((b) => {
         if (b.isWhiteoutOnly || !b.currentText) return b;
         if (scope === "page" && b.pageNumber !== currentPage) return b;
         if (!regex.test(b.currentText)) return b;
-        replacedCount++;
-        return {
-          ...b,
-          currentText: b.currentText.replace(regex, replaceQuery),
-        };
+        count++;
+        return { ...b, currentText: b.currentText.replace(regex, replaceQuery) };
       })
     );
 
-    if (replacedCount > 0) {
+    if (count > 0) {
       setSuccessMessage(
-        `Replaced ${replacedCount} occurrence(s) of "${findQuery}" with "${replaceQuery}" (${
-          scope === "all" ? "entire PDF" : `Page ${currentPage}`
-        }).`
+        `Replaced ${count} occurrence(s) of "${findQuery}" with "${replaceQuery}".`
       );
     }
   };
 
-  // Keyboard shortcuts: Ctrl/Cmd+Z (Undo), Ctrl/Cmd+Y or Ctrl+Shift+Z (Redo), Ctrl+F (Find), Esc (Deselect)
+  // Keyboard Shortcuts
   useEffect(() => {
     if (!file) return;
     const onKeyDown = (e: KeyboardEvent) => {
-      const activeTag = document.activeElement?.tagName.toLowerCase();
-      const isTypingInInput =
-        activeTag === "input" || activeTag === "textarea";
+      const isInput = ["input", "textarea"].includes(
+        document.activeElement?.tagName.toLowerCase() || ""
+      );
 
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "z") {
-        if (!isTypingInInput) {
+        if (!isInput) {
           e.preventDefault();
-          if (e.shiftKey) {
-            handleRedo();
-          } else {
-            handleUndo();
-          }
+          if (e.shiftKey) handleRedo();
+          else handleUndo();
         }
       } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "y") {
-        if (!isTypingInInput) {
+        if (!isInput) {
           e.preventDefault();
           handleRedo();
         }
@@ -815,11 +791,7 @@ export default function EditPdfPage() {
         setShowFindReplace((v) => !v);
       } else if (e.key === "Escape") {
         setSelectedBlockId(null);
-      } else if (
-        (e.key === "Delete" || e.key === "Backspace") &&
-        !isTypingInInput &&
-        selectedBlockId
-      ) {
+      } else if ((e.key === "Delete" || e.key === "Backspace") && !isInput && selectedBlockId) {
         const blk = textBlocks.find((b) => b.id === selectedBlockId);
         if (blk) {
           e.preventDefault();
@@ -831,7 +803,7 @@ export default function EditPdfPage() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [file, selectedBlockId, textBlocks, handleUndo, handleRedo, handleDeleteOrClearBlock]);
 
-  // Pointer drag & resize handlers
+  // Pointer drag & resize
   const handleStartInteraction = (
     block: TextBlockItem,
     mode: "drag" | "resize",
@@ -859,47 +831,28 @@ export default function EditPdfPage() {
     const handleMove = (e: PointerEvent) => {
       if (!interactionRef.current || !pageContainerRef.current) return;
       const rect = pageContainerRef.current.getBoundingClientRect();
-      const dx =
-        ((e.clientX - interactionRef.current.clientX) / rect.width) * 100;
-      const dy =
-        ((e.clientY - interactionRef.current.clientY) / rect.height) * 100;
-
+      const dx = ((e.clientX - interactionRef.current.clientX) / rect.width) * 100;
+      const dy = ((e.clientY - interactionRef.current.clientY) / rect.height) * 100;
       const targetId = interactionRef.current.id;
 
       if (interactionMode === "drag") {
-        const newX = Math.max(
-          0,
-          Math.min(96, interactionRef.current.origX + dx)
-        );
-        const newY = Math.max(
-          0,
-          Math.min(96, interactionRef.current.origY + dy)
-        );
+        const newX = Math.max(0, Math.min(96, interactionRef.current.origX + dx));
+        const newY = Math.max(0, Math.min(96, interactionRef.current.origY + dy));
         setTextBlocks((prev) =>
-          prev.map((b) =>
-            b.id === targetId ? { ...b, xPercent: newX, yPercent: newY } : b
-          )
+          prev.map((b) => (b.id === targetId ? { ...b, xPercent: newX, yPercent: newY } : b))
         );
       } else if (interactionMode === "resize") {
         const newW = Math.max(
           2,
-          Math.min(
-            100 - interactionRef.current.origX,
-            interactionRef.current.origW + dx
-          )
+          Math.min(100 - interactionRef.current.origX, interactionRef.current.origW + dx)
         );
         const newH = Math.max(
-          1.4,
-          Math.min(
-            100 - interactionRef.current.origY,
-            interactionRef.current.origH + dy
-          )
+          1.2,
+          Math.min(100 - interactionRef.current.origY, interactionRef.current.origH + dy)
         );
         setTextBlocks((prev) =>
           prev.map((b) =>
-            b.id === targetId
-              ? { ...b, widthPercent: newW, heightPercent: newH }
-              : b
+            b.id === targetId ? { ...b, widthPercent: newW, heightPercent: newH } : b
           )
         );
       }
@@ -907,8 +860,7 @@ export default function EditPdfPage() {
 
     const handleUp = () => {
       if (interactionRef.current) {
-        const snap = interactionRef.current.snapshotBeforeDrag;
-        pushUndoSnapshot(snap);
+        pushUndoSnapshot(interactionRef.current.snapshotBeforeDrag);
       }
       setInteractionMode("none");
       interactionRef.current = null;
@@ -923,8 +875,7 @@ export default function EditPdfPage() {
   }, [interactionMode, pushUndoSnapshot]);
 
   /**
-   * Renders replacement text onto a 3x Retina canvas with full font-family, bold, italic,
-   * alignment, and RTL/Unicode support.
+   * High-DPI Replacement Canvas Stamp with accurate typography rendering
    */
   const renderReplacementTextToPng = (
     block: TextBlockItem,
@@ -935,23 +886,18 @@ export default function EditPdfPage() {
     const measureCanvas = document.createElement("canvas");
     const mCtx = measureCanvas.getContext("2d")!;
     const fontPx = Math.max(8, block.fontSizePt) * SCALE;
-    const fontStylePrefix = `${block.isItalic ? "italic " : ""}${
-      block.isBold ? "bold " : ""
-    }`;
-    const fontSpec = `${fontStylePrefix}${fontPx}px ${
-      FONT_CSS_MAP[block.fontFamily]
-    }`;
+    const fontStylePrefix = `${block.isItalic ? "italic " : ""}${block.isBold ? "bold " : ""}`;
+    const fontSpec = `${fontStylePrefix}${fontPx}px ${FONT_CSS_MAP[block.fontFamily]}`;
     mCtx.font = fontSpec;
 
-    const measuredW = mCtx.measureText(block.currentText).width + 8 * SCALE;
+    const measuredW = mCtx.measureText(block.currentText).width + 6 * SCALE;
     const finalW = Math.max(boxWidthPt * SCALE, measuredW);
-    const finalH = Math.max(boxHeightPt * SCALE, fontPx * 1.24);
+    const finalH = Math.max(boxHeightPt * SCALE, fontPx * 1.25);
 
     const canvas = document.createElement("canvas");
     canvas.width = Math.ceil(finalW);
     canvas.height = Math.ceil(finalH);
     const ctx = canvas.getContext("2d")!;
-
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
     const isRTL = /[\u0600-\u06FF]/.test(block.currentText);
@@ -960,11 +906,7 @@ export default function EditPdfPage() {
     ctx.fillStyle = block.color;
     ctx.textBaseline = "alphabetic";
 
-    // Align baseline with original PDF glyph baseline (~82% down from top of glyph box)
-    const baselineY = Math.min(
-      canvas.height - 2 * SCALE,
-      Math.max(fontPx * 0.84, canvas.height * 0.78)
-    );
+    const baselineY = fontPx * 0.85;
 
     if (isRTL || block.textAlign === "right") {
       ctx.textAlign = "right";
@@ -1002,9 +944,7 @@ export default function EditPdfPage() {
 
     try {
       const arrayBuffer = await file.arrayBuffer();
-      const pdfDoc = await PDFDocument.load(arrayBuffer, {
-        ignoreEncryption: false,
-      });
+      const pdfDoc = await PDFDocument.load(arrayBuffer, { ignoreEncryption: false });
       const pages = pdfDoc.getPages();
 
       for (const block of modifiedBlocks) {
@@ -1012,47 +952,45 @@ export default function EditPdfPage() {
         if (pageIdx < 0 || pageIdx >= pages.length) continue;
         const page = pages[pageIdx];
         const { width: pageW, height: pageH } = page.getSize();
-
         const maskHex = resolveMaskHex(block);
 
-        // 1. Always mask out the original PDF text at its ORIGINAL coordinates (for existing text lines)
+        // 1. Mask out original text (Bottom-Left origin in pdf-lib)
         if (!block.isNew && maskHex !== "transparent") {
           const origW = (block.origWidthPercent / 100) * pageW;
           const origH = (block.origHeightPercent / 100) * pageH;
           const origX = (block.origXPercent / 100) * pageW;
-          const origY = pageH - (block.origYPercent / 100) * pageH - origH;
+          const origYBottom = pageH - ((block.origYPercent + block.origHeightPercent) / 100) * pageH;
           const { r, g, b } = hexToRgbComponents(maskHex);
 
           page.drawRectangle({
-            x: Math.max(0, origX - 1),
-            y: Math.max(0, origY - 1),
-            width: origW + 2,
-            height: origH + 2,
+            x: Math.max(0, origX - 1.5),
+            y: Math.max(0, origYBottom - 1.5),
+            width: origW + 3,
+            height: origH + 3,
             color: rgb(r, g, b),
           });
         }
 
-        // 2. Compute current box position & render replacement text or whiteout/redaction box
+        // 2. Render new text or whiteout box
         const curW = (block.widthPercent / 100) * pageW;
         const curH = (block.heightPercent / 100) * pageH;
         const curX = (block.xPercent / 100) * pageW;
-        const curTopPt = (block.yPercent / 100) * pageH;
+        const curYBottom = pageH - ((block.yPercent + block.heightPercent) / 100) * pageH;
 
         if (block.isWhiteoutOnly) {
           const fillHex = maskHex === "transparent" ? "#ffffff" : maskHex;
           const { r, g, b } = hexToRgbComponents(fillHex);
           page.drawRectangle({
             x: Math.max(0, curX),
-            y: Math.max(0, pageH - curTopPt - curH),
+            y: Math.max(0, curYBottom),
             width: curW,
             height: curH,
             color: rgb(r, g, b),
           });
         } else if (block.currentText.trim()) {
           const rendered = renderReplacementTextToPng(block, curW, curH);
-          const drawY = pageH - curTopPt - rendered.heightPt;
+          const drawY = pageH - (block.yPercent / 100) * pageH - rendered.heightPt;
 
-          // If user chose an opaque background mask for moved/new/wider text, fill behind the new text box too
           if (maskHex !== "transparent") {
             const { r, g, b } = hexToRgbComponents(maskHex);
             page.drawRectangle({
@@ -1064,9 +1002,7 @@ export default function EditPdfPage() {
             });
           }
 
-          const pngBytes = await fetch(rendered.dataUrl).then((r) =>
-            r.arrayBuffer()
-          );
+          const pngBytes = dataUrlToBytes(rendered.dataUrl);
           const pngImg = await pdfDoc.embedPng(pngBytes);
 
           page.drawImage(pngImg, {
@@ -1081,32 +1017,18 @@ export default function EditPdfPage() {
       const savedBytes = await pdfDoc.save({ useObjectStreams: true });
       const outName = `edited_${file.name}`;
       downloadBlob(savedBytes, outName);
-      setSuccessMessage(
-        `Saved ${modifiedBlocks.length} text edit(s) into "${outName}".`
-      );
+      setSuccessMessage(`Saved ${modifiedBlocks.length} edit(s) into "${outName}".`);
     } catch (err: unknown) {
-      const msg =
-        err instanceof Error ? err.message : "Failed to save edited PDF.";
-      setErrorMessage(msg);
+      setErrorMessage(err instanceof Error ? err.message : "Failed to save edited PDF.");
     } finally {
       setIsSaving(false);
     }
   };
 
-  const currentPageBlocks = textBlocks.filter(
-    (b) => b.pageNumber === currentPage
-  );
-  const detectedExistingLinesOnPage = currentPageBlocks.filter(
-    (b) => !b.isNew
-  ).length;
-  const selectedBlock =
-    textBlocks.find((b) => b.id === selectedBlockId) || null;
-
-  // Accurate CSS pixel scale per PDF point (1pt -> displayScale px)
-  const displayScale =
-    pageBaseSizePt.width > 0
-      ? containerCssWidth / pageBaseSizePt.width
-      : 1.15;
+  const currentPageBlocks = textBlocks.filter((b) => b.pageNumber === currentPage);
+  const detectedExistingLinesOnPage = currentPageBlocks.filter((b) => !b.isNew).length;
+  const selectedBlock = textBlocks.find((b) => b.id === selectedBlockId) || null;
+  const displayScale = pageBaseSizePt.width > 0 ? containerCssWidth / pageBaseSizePt.width : 1.15;
 
   return (
     <ToolLayout
@@ -1143,7 +1065,7 @@ export default function EditPdfPage() {
 
         {file && (
           <div className="space-y-4 rounded-2xl border border-slate-200 bg-slate-50/60 p-4 sm:p-6 dark:border-slate-800 dark:bg-slate-900/60">
-            {/* Top Primary Toolbar */}
+            {/* Top Toolbar */}
             <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 dark:border-slate-800 pb-3.5">
               <div className="flex items-center gap-3">
                 <div className="flex h-10 w-10 items-center justify-center rounded-lg border border-rose-100 bg-rose-50 text-rose-600 dark:border-rose-900/40 dark:bg-rose-950/40 dark:text-rose-400">
@@ -1156,7 +1078,7 @@ export default function EditPdfPage() {
                   <p className="font-mono text-xs text-slate-500 dark:text-slate-400">
                     Page {currentPage} of {totalPages} •{" "}
                     <span className="text-rose-600 dark:text-rose-400 font-bold">
-                      {detectedExistingLinesOnPage} existing text lines
+                      {detectedExistingLinesOnPage} existing lines
                     </span>
                     {modifiedBlocks.length > 0 && (
                       <span className="ml-1.5 text-emerald-600 dark:text-emerald-400 font-bold">
@@ -1167,9 +1089,8 @@ export default function EditPdfPage() {
                 </div>
               </div>
 
-              {/* Action & History Toolbar */}
+              {/* Action Toolbar */}
               <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
-                {/* Undo / Redo */}
                 <div className="inline-flex items-center rounded-xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900 p-0.5">
                   <button
                     type="button"
@@ -1191,7 +1112,6 @@ export default function EditPdfPage() {
                   </button>
                 </div>
 
-                {/* Find & Replace Toggle */}
                 <button
                   type="button"
                   onClick={() => setShowFindReplace((v) => !v)}
@@ -1205,7 +1125,6 @@ export default function EditPdfPage() {
                   <span>Find & Replace</span>
                 </button>
 
-                {/* Add Free Text */}
                 <button
                   type="button"
                   onClick={handleAddFreeText}
@@ -1215,7 +1134,6 @@ export default function EditPdfPage() {
                   <span>+ Add Text</span>
                 </button>
 
-                {/* Add Whiteout / Redact Box */}
                 <button
                   type="button"
                   onClick={handleAddWhiteoutBox}
@@ -1225,31 +1143,22 @@ export default function EditPdfPage() {
                   <span>+ Whiteout / Redact</span>
                 </button>
 
-                {/* Preview Clean PDF Toggle */}
                 <button
                   type="button"
                   onClick={() => {
                     setPreviewCleanMode((v) => !v);
                     setSelectedBlockId(null);
                   }}
-                  title="Toggle Clean Preview (hide edit boxes)"
                   className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-2 text-xs font-semibold transition-colors ${
                     previewCleanMode
                       ? "border-emerald-600 bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300"
                       : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-300"
                   }`}
                 >
-                  {previewCleanMode ? (
-                    <EyeOff className="h-3.5 w-3.5 text-emerald-600" />
-                  ) : (
-                    <Eye className="h-3.5 w-3.5" />
-                  )}
-                  <span className="hidden sm:inline">
-                    {previewCleanMode ? "Exit Preview" : "Preview"}
-                  </span>
+                  {previewCleanMode ? <EyeOff className="h-3.5 w-3.5 text-emerald-600" /> : <Eye className="h-3.5 w-3.5" />}
+                  <span className="hidden sm:inline">{previewCleanMode ? "Exit Preview" : "Preview"}</span>
                 </button>
 
-                {/* Close File */}
                 <button
                   type="button"
                   onClick={() => {
@@ -1265,7 +1174,7 @@ export default function EditPdfPage() {
               </div>
             </div>
 
-            {/* Find & Replace Drawer (Sejda-style batch text replacement) */}
+            {/* Find & Replace Drawer */}
             {showFindReplace && (
               <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white p-3 text-xs shadow-xs dark:border-slate-800 dark:bg-slate-900">
                 <div className="flex flex-wrap items-center gap-2 flex-1">
@@ -1280,8 +1189,7 @@ export default function EditPdfPage() {
                     />
                     {findQuery && (
                       <span className="rounded bg-rose-100 px-1.5 py-0.5 font-mono text-[10px] font-bold text-rose-700 dark:bg-rose-950 dark:text-rose-300">
-                        {matchingBlocks.length} match
-                        {matchingBlocks.length === 1 ? "" : "es"}
+                        {matchingBlocks.length} match{matchingBlocks.length === 1 ? "" : "es"}
                       </span>
                     )}
                   </div>
@@ -1329,49 +1237,23 @@ export default function EditPdfPage() {
               </div>
             )}
 
-            {/* Scanned / Image-Only PDF Detection Banner */}
-            {!isRenderingPage && detectedExistingLinesOnPage === 0 && (
-              <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-200 bg-amber-50/90 px-4 py-3 text-xs text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200">
-                <div className="flex items-center gap-2.5">
-                  <ScanText className="h-4 w-4 text-amber-600 shrink-0" />
-                  <span>
-                    <strong>No selectable text layer found on Page {currentPage}.</strong>{" "}
-                    This page appears to be a scanned image. You can still place{" "}
-                    <strong>+ Whiteout / Redact</strong> boxes and{" "}
-                    <strong>+ Add Text</strong> over any area, or run OCR first.
-                  </span>
-                </div>
-                <Link
-                  href="/tools/ocr-pdf"
-                  className="inline-flex items-center gap-1 rounded-lg bg-amber-600 px-3 py-1.5 font-bold text-white hover:bg-amber-500 shrink-0"
-                >
-                  <span>Open OCR PDF Tool →</span>
-                </Link>
-              </div>
-            )}
-
-            {/* Active Typography & Background Mask Inspector */}
+            {/* Typography & Background Mask Inspector */}
             {selectedBlock ? (
               <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-rose-200 bg-rose-50/70 p-3 text-xs dark:border-rose-900/50 dark:bg-rose-950/30">
                 <div className="flex flex-wrap items-center gap-2.5">
                   <span className="font-bold text-rose-700 dark:text-rose-300 flex items-center gap-1">
                     <Type className="h-3.5 w-3.5" />
-                    <span>
-                      {selectedBlock.isWhiteoutOnly
-                        ? "Whiteout / Redact:"
-                        : "Typography:"}
-                    </span>
+                    <span>{selectedBlock.isWhiteoutOnly ? "Whiteout / Redact:" : "Typography:"}</span>
                   </span>
 
                   {!selectedBlock.isWhiteoutOnly && (
                     <>
-                      {/* Font Family Selector (Auto-Detected Sans, Serif, Mono) */}
                       <select
                         value={selectedBlock.fontFamily}
                         onChange={(e) =>
                           handleUpdateBlock(selectedBlock.id, {
                             fontFamily: e.target.value as PdfFontFamily,
-                          })
+                          }, true)
                         }
                         aria-label="Font Family"
                         className="rounded border border-slate-200 bg-white px-2 py-1 text-xs font-medium text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-white"
@@ -1381,7 +1263,6 @@ export default function EditPdfPage() {
                         <option value="mono">Monospace (Courier)</option>
                       </select>
 
-                      {/* Font Size (pt) */}
                       <div className="flex items-center gap-1">
                         <span className="text-slate-500">Size:</span>
                         <input
@@ -1391,24 +1272,18 @@ export default function EditPdfPage() {
                           value={selectedBlock.fontSizePt}
                           onChange={(e) =>
                             handleUpdateBlock(selectedBlock.id, {
-                              fontSizePt: Math.max(
-                                6,
-                                Math.min(72, Number(e.target.value) || 12)
-                              ),
-                            })
+                              fontSizePt: Math.max(6, Math.min(72, Number(e.target.value) || 12)),
+                            }, true)
                           }
                           className="w-14 rounded border border-slate-200 bg-white px-2 py-1 font-mono text-xs text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-white"
                         />
                       </div>
 
-                      {/* Bold & Italic Toggles */}
                       <div className="inline-flex items-center rounded border border-slate-200 bg-white dark:border-slate-700 dark:bg-slate-900 overflow-hidden">
                         <button
                           type="button"
                           onClick={() =>
-                            handleUpdateBlock(selectedBlock.id, {
-                              isBold: !selectedBlock.isBold,
-                            })
+                            handleUpdateBlock(selectedBlock.id, { isBold: !selectedBlock.isBold }, true)
                           }
                           title="Bold"
                           className={`px-2 py-1 font-bold ${
@@ -1422,9 +1297,7 @@ export default function EditPdfPage() {
                         <button
                           type="button"
                           onClick={() =>
-                            handleUpdateBlock(selectedBlock.id, {
-                              isItalic: !selectedBlock.isItalic,
-                            })
+                            handleUpdateBlock(selectedBlock.id, { isItalic: !selectedBlock.isItalic }, true)
                           }
                           title="Italic"
                           className={`px-2 py-1 border-l border-slate-200 dark:border-slate-700 ${
@@ -1437,32 +1310,19 @@ export default function EditPdfPage() {
                         </button>
                       </div>
 
-                      {/* Text Alignment */}
                       <div className="inline-flex items-center rounded border border-slate-200 bg-white dark:border-slate-700 dark:bg-slate-900 overflow-hidden">
-                        {(
-                          [
-                            { id: "left", icon: AlignLeft, label: "Align Left" },
-                            {
-                              id: "center",
-                              icon: AlignCenter,
-                              label: "Align Center",
-                            },
-                            {
-                              id: "right",
-                              icon: AlignRight,
-                              label: "Align Right",
-                            },
-                          ] as const
-                        ).map((al) => {
+                        {[
+                          { id: "left", icon: AlignLeft, label: "Align Left" },
+                          { id: "center", icon: AlignCenter, label: "Align Center" },
+                          { id: "right", icon: AlignRight, label: "Align Right" },
+                        ].map((al) => {
                           const Icon = al.icon;
                           return (
                             <button
                               key={al.id}
                               type="button"
                               onClick={() =>
-                                handleUpdateBlock(selectedBlock.id, {
-                                  textAlign: al.id,
-                                })
+                                handleUpdateBlock(selectedBlock.id, { textAlign: al.id as TextAlignMode }, true)
                               }
                               title={al.label}
                               className={`px-2 py-1 ${
@@ -1477,7 +1337,6 @@ export default function EditPdfPage() {
                         })}
                       </div>
 
-                      {/* Ink Color Swatches + Custom Color Picker */}
                       <div className="flex items-center gap-1.5">
                         <span className="text-slate-500">Ink:</span>
                         {[
@@ -1489,16 +1348,10 @@ export default function EditPdfPage() {
                           <button
                             key={c.hex}
                             type="button"
-                            onClick={() =>
-                              handleUpdateBlock(selectedBlock.id, {
-                                color: c.hex,
-                              })
-                            }
+                            onClick={() => handleUpdateBlock(selectedBlock.id, { color: c.hex }, true)}
                             style={{ backgroundColor: c.hex }}
                             className={`h-5 w-5 rounded-full border-2 ${
-                              selectedBlock.color.toLowerCase() === c.hex
-                                ? "border-rose-500 scale-110"
-                                : "border-white"
+                              selectedBlock.color.toLowerCase() === c.hex ? "border-rose-500 scale-110" : "border-white"
                             }`}
                             title={c.label}
                           />
@@ -1506,43 +1359,29 @@ export default function EditPdfPage() {
                         <input
                           type="color"
                           value={selectedBlock.color}
-                          onChange={(e) =>
-                            handleUpdateBlock(selectedBlock.id, {
-                              color: e.target.value,
-                            })
-                          }
-                          title="Custom Text Color"
+                          onChange={(e) => handleUpdateBlock(selectedBlock.id, { color: e.target.value }, true)}
+                          title="Custom Color"
                           className="h-5 w-6 cursor-pointer rounded border border-slate-300 bg-white p-0"
                         />
                       </div>
                     </>
                   )}
 
-                  {/* Background Mask Selector (including Auto-Sampled Paper Color!) */}
                   <div className="flex flex-wrap items-center gap-1">
                     <span className="text-slate-500">Mask:</span>
-                    {(
-                      [
-                        {
-                          id: "auto",
-                          label: `Auto (${selectedBlock.autoBgHex})`,
-                        },
-                        { id: "white", label: "White" },
-                        { id: "cream", label: "Warm" },
-                        { id: "black", label: "Redact" },
-                        ...(selectedBlock.isNew && !selectedBlock.isWhiteoutOnly
-                          ? [{ id: "transparent" as const, label: "None" }]
-                          : []),
-                      ] as const
-                    ).map((m) => (
+                    {[
+                      { id: "auto", label: `Auto (${selectedBlock.autoBgHex})` },
+                      { id: "white", label: "White" },
+                      { id: "cream", label: "Warm" },
+                      { id: "black", label: "Redact" },
+                      ...(selectedBlock.isNew && !selectedBlock.isWhiteoutOnly
+                        ? [{ id: "transparent" as const, label: "None" }]
+                        : []),
+                    ].map((m) => (
                       <button
                         key={m.id}
                         type="button"
-                        onClick={() =>
-                          handleUpdateBlock(selectedBlock.id, {
-                            maskBg: m.id,
-                          })
-                        }
+                        onClick={() => handleUpdateBlock(selectedBlock.id, { maskBg: m.id as MaskBgMode }, true)}
                         className={`rounded border px-2 py-0.5 text-[11px] font-semibold ${
                           selectedBlock.maskBg === m.id
                             ? "border-rose-600 bg-white text-rose-600 font-bold"
@@ -1554,31 +1393,21 @@ export default function EditPdfPage() {
                     ))}
                     <input
                       type="color"
-                      value={
-                        selectedBlock.maskBg === "custom"
-                          ? selectedBlock.customMaskHex
-                          : selectedBlock.autoBgHex
-                      }
+                      value={selectedBlock.maskBg === "custom" ? selectedBlock.customMaskHex : selectedBlock.autoBgHex}
                       onChange={(e) =>
-                        handleUpdateBlock(selectedBlock.id, {
-                          maskBg: "custom",
-                          customMaskHex: e.target.value,
-                        })
+                        handleUpdateBlock(selectedBlock.id, { maskBg: "custom", customMaskHex: e.target.value }, true)
                       }
-                      title="Custom Mask Background Color"
+                      title="Custom Mask Color"
                       className="h-5 w-6 cursor-pointer rounded border border-slate-300 bg-white p-0"
                     />
                   </div>
                 </div>
 
-                {/* Restore / Delete Controls */}
                 <div className="flex items-center gap-2">
                   {!selectedBlock.isNew && isBlockModified(selectedBlock) && (
                     <button
                       type="button"
-                      onClick={() =>
-                        handleRestoreOriginalBlock(selectedBlock.id)
-                      }
+                      onClick={() => handleRestoreOriginalBlock(selectedBlock.id)}
                       className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-slate-600 hover:text-slate-900"
                     >
                       <RotateCcw className="h-3 w-3" />
@@ -1592,32 +1421,24 @@ export default function EditPdfPage() {
                     className="inline-flex items-center gap-1 rounded-lg border border-red-200 bg-red-50 px-2.5 py-1 font-semibold text-red-600 hover:bg-red-100"
                   >
                     <Trash2 className="h-3 w-3" />
-                    <span>
-                      {selectedBlock.isNew ? "Delete Box" : "Blank Out Line"}
-                    </span>
+                    <span>{selectedBlock.isNew ? "Delete Box" : "Blank Out Line"}</span>
                   </button>
                 </div>
               </div>
             ) : (
-              /* Status & Zoom / Page Navigation Bar */
               <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-xs text-slate-600 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-400">
                 <span className="flex items-center gap-2 font-medium">
                   <Sparkles className="h-4 w-4 text-rose-600 shrink-0" />
                   <span>
-                    Click any text line on the page to edit it in-place with{" "}
-                    <strong>auto-matched font & background</strong>, or drag the
-                    corner handle to resize.
+                    Click any text line on the page to edit it in-place with <strong>auto-matched font & background</strong>.
                   </span>
                 </span>
 
                 <div className="flex items-center gap-3 shrink-0">
-                  {/* Zoom Controls */}
                   <div className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-slate-50 px-1.5 py-0.5 dark:border-slate-800 dark:bg-slate-800">
                     <button
                       type="button"
-                      onClick={() =>
-                        setZoomPercent((z) => Math.max(75, z - 25))
-                      }
+                      onClick={() => setZoomPercent((z) => Math.max(75, z - 25))}
                       disabled={zoomPercent <= 75}
                       title="Zoom Out"
                       className="p-1 text-slate-600 hover:text-slate-900 disabled:opacity-30 dark:text-slate-300"
@@ -1629,9 +1450,7 @@ export default function EditPdfPage() {
                     </span>
                     <button
                       type="button"
-                      onClick={() =>
-                        setZoomPercent((z) => Math.min(200, z + 25))
-                      }
+                      onClick={() => setZoomPercent((z) => Math.min(200, z + 25))}
                       disabled={zoomPercent >= 200}
                       title="Zoom In"
                       className="p-1 text-slate-600 hover:text-slate-900 disabled:opacity-30 dark:text-slate-300"
@@ -1640,13 +1459,10 @@ export default function EditPdfPage() {
                     </button>
                   </div>
 
-                  {/* Page Navigation */}
                   <div className="flex items-center gap-1.5">
                     <button
                       type="button"
-                      onClick={() =>
-                        currentPage > 1 && setCurrentPage((p) => p - 1)
-                      }
+                      onClick={() => currentPage > 1 && setCurrentPage((p) => p - 1)}
                       disabled={currentPage <= 1 || isRenderingPage}
                       className="rounded-lg border border-slate-200 p-1.5 text-slate-600 hover:bg-slate-100 dark:border-slate-800 dark:text-slate-400 disabled:opacity-30"
                     >
@@ -1657,10 +1473,7 @@ export default function EditPdfPage() {
                     </span>
                     <button
                       type="button"
-                      onClick={() =>
-                        currentPage < totalPages &&
-                        setCurrentPage((p) => p + 1)
-                      }
+                      onClick={() => currentPage < totalPages && setCurrentPage((p) => p + 1)}
                       disabled={currentPage >= totalPages || isRenderingPage}
                       className="rounded-lg border border-slate-200 p-1.5 text-slate-600 hover:bg-slate-100 dark:border-slate-800 dark:text-slate-400 disabled:opacity-30"
                     >
@@ -1685,19 +1498,14 @@ export default function EditPdfPage() {
               <div
                 ref={pageContainerRef}
                 style={{
-                  width: `${Math.round(
-                    pageBaseSizePt.width * 1.35 * (zoomPercent / 100)
-                  )}px`,
+                  width: `${Math.round(pageBaseSizePt.width * 1.35 * (zoomPercent / 100))}px`,
                   maxWidth: zoomPercent > 100 ? "none" : "100%",
                 }}
                 className="relative inline-block select-none shadow-xl border border-slate-200/80 bg-white shrink-0"
               >
-                <canvas
-                  ref={pdfCanvasRef}
-                  className="block w-full h-auto rounded-xs"
-                />
+                <canvas ref={pdfCanvasRef} className="block w-full h-auto rounded-xs" />
 
-                {/* Render Mask Over Original Position if an Existing Block Was Moved */}
+                {/* Mask for moved blocks */}
                 {currentPageBlocks
                   .filter(
                     (b) =>
@@ -1723,41 +1531,35 @@ export default function EditPdfPage() {
                     );
                   })}
 
-                {/* Interactive Text & Whiteout Overlays */}
+                {/* Overlays with bounded width/height and pixel-accurate hitboxes */}
                 {currentPageBlocks.map((block) => {
-                  const isSelected =
-                    !previewCleanMode && selectedBlockId === block.id;
+                  const isSelected = !previewCleanMode && selectedBlockId === block.id;
                   const isModified = isBlockModified(block);
                   const isFindHit =
                     findQuery.trim().length > 0 &&
                     !block.isWhiteoutOnly &&
                     (caseSensitiveFind
                       ? block.currentText.includes(findQuery)
-                      : block.currentText
-                          .toLowerCase()
-                          .includes(findQuery.toLowerCase()));
+                      : block.currentText.toLowerCase().includes(findQuery.toLowerCase()));
 
-                  // In Clean Preview mode, hide unmodified existing text boxes completely
-                  if (previewCleanMode && !isModified) {
-                    return null;
-                  }
+                  if (previewCleanMode && !isModified) return null;
 
                   const maskHex = resolveMaskHex(block);
                   const showOpaqueBg =
                     block.isWhiteoutOnly ||
                     ((isSelected || isModified) && maskHex !== "transparent");
 
-                  const scaledFontPx = Math.max(
-                    9,
-                    block.fontSizePt * displayScale
-                  );
+                  const scaledFontPx = Math.max(9, block.fontSizePt * displayScale);
 
                   return (
                     <div
                       key={block.id}
+                      data-block-id={block.id}
+                      data-original-text={block.originalText}
                       onClick={(e) => {
                         e.stopPropagation();
                         if (!previewCleanMode) {
+                          pushUndoSnapshot(textBlocks);
                           setSelectedBlockId(block.id);
                         }
                       }}
@@ -1769,8 +1571,9 @@ export default function EditPdfPage() {
                       style={{
                         left: `${block.xPercent}%`,
                         top: `${block.yPercent}%`,
-                        minWidth: `${block.widthPercent}%`,
-                        minHeight: `${block.heightPercent}%`,
+                        width: `${Math.max(block.widthPercent, 1.8)}%`,
+                        height: `${Math.max(block.heightPercent, 1.4)}%`,
+                        boxSizing: "border-box",
                         backgroundColor: showOpaqueBg
                           ? maskHex === "transparent"
                             ? "#ffffff"
@@ -1792,17 +1595,14 @@ export default function EditPdfPage() {
                               ? "z-25 ring-2 ring-amber-500 bg-amber-200/40"
                               : isModified
                                 ? "z-20 border border-emerald-500/60"
-                                : "z-10 border border-transparent hover:border-dashed hover:border-rose-400 hover:bg-rose-500/5 cursor-text"
+                                : "z-10 border border-transparent hover:border-rose-400/80 hover:bg-rose-500/10 cursor-pointer"
                       }`}
                     >
-                      {/* Drag Handle & Resize Handle when Selected */}
                       {isSelected && (
                         <>
                           <button
                             type="button"
-                            onPointerDown={(e) =>
-                              handleStartInteraction(block, "drag", e)
-                            }
+                            onPointerDown={(e) => handleStartInteraction(block, "drag", e)}
                             title="Drag to move"
                             className="absolute -top-5 left-0 z-40 inline-flex items-center gap-0.5 rounded-t bg-rose-600 px-1.5 py-0.5 text-[9px] font-mono font-bold text-white cursor-move shadow-xs"
                           >
@@ -1811,10 +1611,8 @@ export default function EditPdfPage() {
                           </button>
 
                           <div
-                            onPointerDown={(e) =>
-                              handleStartInteraction(block, "resize", e)
-                            }
-                            title="Drag corner to resize box"
+                            onPointerDown={(e) => handleStartInteraction(block, "resize", e)}
+                            title="Drag corner to resize"
                             className="absolute -bottom-1.5 -right-1.5 z-40 h-3 w-3 rounded-xs border border-white bg-rose-600 cursor-nwse-resize shadow-xs"
                           />
                         </>
@@ -1822,7 +1620,7 @@ export default function EditPdfPage() {
 
                       {block.isWhiteoutOnly ? (
                         <div className="w-full h-full min-h-[16px] cursor-move flex items-center justify-center text-[9px] font-mono text-slate-400">
-                          {isSelected ? "Drag or Resize Mask" : ""}
+                          {isSelected ? "Drag or Resize" : ""}
                         </div>
                       ) : isSelected ? (
                         <input
@@ -1830,9 +1628,7 @@ export default function EditPdfPage() {
                           autoFocus
                           value={block.currentText}
                           onChange={(e) =>
-                            handleUpdateBlock(block.id, {
-                              currentText: e.target.value,
-                            })
+                            handleUpdateBlock(block.id, { currentText: e.target.value }, false)
                           }
                           style={{
                             color: block.color,
@@ -1842,7 +1638,7 @@ export default function EditPdfPage() {
                             fontSize: `${scaledFontPx}px`,
                             textAlign: block.textAlign,
                           }}
-                          className="w-full bg-transparent outline-none leading-none px-0.5"
+                          className="w-full h-full bg-transparent outline-none leading-none px-0.5"
                         />
                       ) : isModified ? (
                         <span
@@ -1854,18 +1650,11 @@ export default function EditPdfPage() {
                             fontSize: `${scaledFontPx}px`,
                             textAlign: block.textAlign,
                           }}
-                          className="whitespace-nowrap leading-none px-0.5"
+                          className="whitespace-nowrap leading-none px-0.5 select-none"
                         >
                           {block.currentText}
                         </span>
-                      ) : (
-                        <span
-                          title={`Click to edit: "${block.originalText}" (${block.fontFamily}, ${block.fontSizePt}pt)`}
-                          className="w-full h-full block opacity-0 group-hover:opacity-100 text-[9px] font-mono bg-rose-600 text-white px-1 rounded-xs pointer-events-none truncate max-w-[90px]"
-                        >
-                          Edit
-                        </span>
-                      )}
+                      ) : null}
                     </div>
                   );
                 })}
@@ -1886,13 +1675,13 @@ export default function EditPdfPage() {
               </div>
             )}
 
-            {/* Bottom Save & Shortcut Bar */}
+            {/* Bottom Save Bar */}
             <div className="flex flex-col sm:flex-row items-center justify-between gap-4 pt-2 border-t border-slate-200 dark:border-slate-800">
               <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500 dark:text-slate-400 font-medium">
                 <span>
                   {modifiedBlocks.length > 0
                     ? `${modifiedBlocks.length} text change(s) ready to apply.`
-                    : "Click any existing text on the PDF page above to modify it."}
+                    : "Click any text above to edit it."}
                 </span>
                 <span className="hidden md:inline font-mono text-[11px] text-slate-400">
                   • Shortcuts: Ctrl+Z Undo • Ctrl+F Find & Replace • Esc Deselect
@@ -1913,9 +1702,7 @@ export default function EditPdfPage() {
                 ) : (
                   <>
                     <Download className="h-4 w-4 text-white" />
-                    <span>
-                      Save & Download Edited PDF ({modifiedBlocks.length})
-                    </span>
+                    <span>Save & Download Edited PDF ({modifiedBlocks.length})</span>
                   </>
                 )}
               </button>
