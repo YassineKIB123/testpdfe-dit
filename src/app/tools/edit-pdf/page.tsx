@@ -36,11 +36,13 @@ import {
   AlignRight,
   ScanText,
   Check,
+  MousePointerClick,
 } from "lucide-react";
 
 export type PdfFontFamily = "calibri" | "sans" | "serif" | "mono";
 export type MaskBgMode = "auto" | "white" | "cream" | "black" | "transparent" | "custom";
 export type TextAlignMode = "left" | "center" | "right";
+export type SelectionGranularity = "word" | "line" | "paragraph";
 
 export interface TextBlockItem {
   id: string;
@@ -49,6 +51,8 @@ export interface TextBlockItem {
   currentText: string;
   isNew: boolean;
   isWhiteoutOnly?: boolean;
+  isMultiline?: boolean;
+  lineHeightPt?: number;
   origXPercent: number;
   origYPercent: number;
   origBaselineYPercent: number;
@@ -123,10 +127,6 @@ function dataUrlToUint8Array(dataUrl: string): Uint8Array {
   return bytes;
 }
 
-/**
- * Scans the raw PDF file bytes for `/BaseFont /...` entries to determine the document's
- * primary embedded font family (e.g., LaTeX CMR/SFRM/LMRoman -> "serif", Word Calibri -> "calibri").
- */
 function detectDocumentDefaultFontFromBytes(buffer: ArrayBuffer): PdfFontFamily {
   try {
     const slice = buffer.slice(0, Math.min(buffer.byteLength, 2 * 1024 * 1024));
@@ -167,10 +167,6 @@ function detectDocumentDefaultFontFromBytes(buffer: ArrayBuffer): PdfFontFamily 
   }
 }
 
-/**
- * Classifies a font name string into PdfFontFamily, bold, and italic flags,
- * supporting LaTeX (CMR, SFRM, LMRoman, CMBX, SFBX, CMTI, SFTI), Word (Calibri), and standard PDF fonts.
- */
 function classifyPdfFontMetadata(
   realFontName: string,
   fallbackStyleFamily: string,
@@ -223,10 +219,6 @@ function classifyPdfFontMetadata(
   return { fontFamily, isBold, isItalic };
 }
 
-/**
- * Calibrates the exact decimal fontSizePt so that the browser's canvas font matches
- * the exact horizontal width (`targetWidthPt`) and visual x-height of the PDF line.
- */
 function calibrateFontSizePt(
   text: string,
   targetWidthPt: number,
@@ -236,9 +228,10 @@ function calibrateFontSizePt(
   isItalic: boolean
 ): number {
   const fallback = Math.round(rawFontSizePt * 10) / 10;
+  const firstLine = (text || "").split("\n")[0];
   if (
-    !text ||
-    text.trim().length < 3 ||
+    !firstLine ||
+    firstLine.trim().length < 3 ||
     targetWidthPt <= 8 ||
     typeof document === "undefined"
   ) {
@@ -251,7 +244,7 @@ function calibrateFontSizePt(
     const testPx = 100;
     const prefix = `${isItalic ? "italic " : ""}${isBold ? "bold " : ""}`;
     ctx.font = `${prefix}${testPx}px ${FONT_CSS_MAP[fontFamily]}`;
-    const measuredAt100 = ctx.measureText(text).width;
+    const measuredAt100 = ctx.measureText(firstLine).width;
     if (measuredAt100 <= 0) return fallback;
 
     const widthMatchedPt = (targetWidthPt / measuredAt100) * testPx;
@@ -265,13 +258,6 @@ function calibrateFontSizePt(
   }
 }
 
-/**
- * Samples the rendered PDF canvas for a text bounding box to detect:
- * 1. Background paper/cell color (`autoBgHex`) from perimeter pixels
- * 2. Optical stroke ink color (`autoFgHex`) from the 22nd–54th contrast percentile of glyph pixels
- *    (compensating for browser DirectWrite stem darkening so thin LaTeX/PDF fonts never look too dark!)
- * 3. Pixel-level Serif foot ratio (`pixelIsSerif`) by comparing baseline serif-foot row density vs mid-stem rows
- */
 function sampleCanvasStyleForBox(
   ctx: CanvasRenderingContext2D,
   canvasW: number,
@@ -454,14 +440,61 @@ export function isBlockModified(b: TextBlockItem): boolean {
   );
 }
 
+/**
+ * Word-wraps a string (respecting explicit `\n` breaks and `maxWidthPx`) into lines for multi-line rendering.
+ */
+function wrapTextIntoLines(
+  ctx: CanvasRenderingContext2D,
+  text: string,
+  maxWidthPx: number,
+  isMultiline?: boolean
+): string[] {
+  if (!isMultiline && !text.includes("\n")) {
+    return [text];
+  }
+  const paragraphs = text.split("\n");
+  const out: string[] = [];
+  for (const para of paragraphs) {
+    const words = para.split(" ");
+    let currentLine = "";
+    for (const w of words) {
+      const candidate = currentLine ? `${currentLine} ${w}` : w;
+      if (currentLine && maxWidthPx > 20 && ctx.measureText(candidate).width > maxWidthPx * 1.03) {
+        out.push(currentLine);
+        currentLine = w;
+      } else {
+        currentLine = candidate;
+      }
+    }
+    out.push(currentLine);
+  }
+  return out.length > 0 ? out : [text];
+}
+
 export default function EditPdfPage() {
   const [file, setFile] = useState<File | null>(null);
   const [totalPages, setTotalPages] = useState<number>(0);
   const [currentPage, setCurrentPage] = useState<number>(1);
   const [pdfDocProxy, setPdfDocProxy] = useState<any>(null);
 
+  // Selection Granularity: "word" (individual words), "line" (lines), or "paragraph" (multi-line blocks)
+  // Plus users can ALWAYS drag a selection rectangle over ANY exact amount of text!
+  const [selectionGranularity, setSelectionGranularity] =
+    useState<SelectionGranularity>("line");
+
   const [textBlocks, setTextBlocks] = useState<TextBlockItem[]>([]);
+  const [wordTokensByPage, setWordTokensByPage] = useState<
+    Record<number, TextBlockItem[]>
+  >({});
   const [selectedBlockId, setSelectedBlockId] = useState<string | null>(null);
+
+  // Drag-Select Marquee state for selecting any custom amount of text (1 word, 3 words, or multi-line region)
+  const [marqueeRect, setMarqueeRect] = useState<{
+    startX: number;
+    startY: number;
+    curX: number;
+    curY: number;
+  } | null>(null);
 
   const [showFindReplace, setShowFindReplace] = useState(true);
   const [findQuery, setFindQuery] = useState("");
@@ -489,13 +522,14 @@ export default function EditPdfPage() {
 
   const docDefaultFontRef = useRef<PdfFontFamily>("serif");
   const extractedPagesRef = useRef<Set<number>>(new Set());
-  const colorSampledPagesRef = useRef<Set<number>>(new Set());
 
   const basePageCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const pageContainerRef = useRef<HTMLDivElement>(null);
   const pdfCanvasRef = useRef<HTMLCanvasElement>(null);
 
-  const [interactionMode, setInteractionMode] = useState<"none" | "drag" | "resize">("none");
+  const [interactionMode, setInteractionMode] = useState<
+    "none" | "drag" | "resize" | "marquee"
+  >("none");
   const interactionRef = useRef<{
     id: string;
     clientX: number;
@@ -546,7 +580,134 @@ export default function EditPdfPage() {
     });
   }, [textBlocks]);
 
-  const extractTextBlocksFromPage = useCallback(
+  /**
+   * Builds blocks at the requested granularity ("word", "line", or "paragraph") from word-level tokens,
+   * preserving any blocks the user has already modified!
+   */
+  const buildBlocksForGranularity = useCallback(
+    (
+      words: TextBlockItem[],
+      granularity: SelectionGranularity,
+      pageW: number,
+      pageH: number
+    ): TextBlockItem[] => {
+      if (words.length === 0) return [];
+      if (granularity === "word") {
+        return words;
+      }
+
+      const listMarkerRegex = /^\s*(\d+[\.\)]|[a-zA-Z][\.\)]|[•●▪◦\-–—\*])\s*$/;
+      const lines: TextBlockItem[] = [];
+
+      for (const w of words) {
+        const last = lines[lines.length - 1];
+        const sameBaseline =
+          last &&
+          Math.abs(last.origBaselineYPercent - w.origBaselineYPercent) <
+            ((Math.min(last.fontSizePt, w.fontSizePt) * 0.45) / pageH) * 100;
+        const gapPct = last
+          ? w.origXPercent - (last.origXPercent + last.origWidthPercent)
+          : Infinity;
+        const fontPctW = (Math.max(last?.fontSizePt || 10, w.fontSizePt) / pageW) * 100;
+        const isLastListMarker = Boolean(last && listMarkerRegex.test(last.originalText));
+
+        if (
+          sameBaseline &&
+          last &&
+          !(isLastListMarker && gapPct > fontPctW * 0.2) &&
+          gapPct >= -fontPctW * 0.4 &&
+          gapPct < fontPctW * 1.8 &&
+          Math.abs(last.fontSizePt - w.fontSizePt) <= 2.2
+        ) {
+          const newRight = Math.max(
+            last.origXPercent + last.origWidthPercent,
+            w.origXPercent + w.origWidthPercent
+          );
+          const newW = newRight - last.origXPercent;
+          const combinedText = `${last.originalText} ${w.originalText}`;
+          const calibratedPt = calibrateFontSizePt(
+            combinedText,
+            (newW / 100) * pageW,
+            last.fontSizePt,
+            last.fontFamily,
+            last.isBold,
+            last.isItalic
+          );
+
+          last.originalText = combinedText;
+          last.currentText = combinedText;
+          last.origWidthPercent = newW;
+          last.widthPercent = newW;
+          last.origHeightPercent = Math.max(last.origHeightPercent, w.origHeightPercent);
+          last.heightPercent = last.origHeightPercent;
+          last.fontSizePt = calibratedPt;
+        } else {
+          lines.push({ ...w, id: `line_${w.id}` });
+        }
+      }
+
+      if (granularity === "line") {
+        return lines;
+      }
+
+      const paragraphs: TextBlockItem[] = [];
+      for (const ln of lines) {
+        const lastP = paragraphs[paragraphs.length - 1];
+        const lineHeightPct = (ln.fontSizePt / pageH) * 100;
+        const verticalStepPct = lastP
+          ? ln.origBaselineYPercent -
+            (lastP.origYPercent + lastP.origHeightPercent - lineHeightPct * 0.25)
+          : Infinity;
+        const sameIndent = lastP && Math.abs(lastP.origXPercent - ln.origXPercent) < 3.5;
+        const sameFont =
+          lastP &&
+          lastP.fontFamily === ln.fontFamily &&
+          Math.abs(lastP.fontSizePt - ln.fontSizePt) <= 1.5 &&
+          lastP.isBold === ln.isBold;
+
+        if (
+          lastP &&
+          sameIndent &&
+          sameFont &&
+          verticalStepPct > 0 &&
+          verticalStepPct < lineHeightPct * 1.85 &&
+          !listMarkerRegex.test(ln.originalText)
+        ) {
+          const newRight = Math.max(
+            lastP.origXPercent + lastP.origWidthPercent,
+            ln.origXPercent + ln.origWidthPercent
+          );
+          const newBottom = Math.max(
+            lastP.origYPercent + lastP.origHeightPercent,
+            ln.origYPercent + ln.origHeightPercent
+          );
+          lastP.originalText = `${lastP.originalText}\n${ln.originalText}`;
+          lastP.currentText = lastP.originalText;
+          lastP.isMultiline = true;
+          lastP.lineHeightPt = Math.round(ln.fontSizePt * 1.32 * 10) / 10;
+          lastP.origWidthPercent = newRight - lastP.origXPercent;
+          lastP.widthPercent = lastP.origWidthPercent;
+          lastP.origHeightPercent = newBottom - lastP.origYPercent;
+          lastP.heightPercent = lastP.origHeightPercent;
+        } else {
+          paragraphs.push({
+            ...ln,
+            id: `para_${ln.id}`,
+            lineHeightPt: Math.round(ln.fontSizePt * 1.32 * 10) / 10,
+          });
+        }
+      }
+
+      return paragraphs;
+    },
+    []
+  );
+
+  /**
+   * Extracts word-level tokens from a PDF page so the user can hover/click single words,
+   * full lines, paragraphs, OR drag-select any exact custom amount of text!
+   */
+  const extractWordTokensFromPage = useCallback(
     async (
       pdf: any,
       pageNum: number,
@@ -565,7 +726,7 @@ export default function EditPdfPage() {
       const rawItems: any[] = textContent.items || [];
       const stylesDict: Record<string, any> = textContent.styles || {};
 
-      interface RawFragment {
+      interface WordFrag {
         text: string;
         x: number;
         yTop: number;
@@ -578,7 +739,7 @@ export default function EditPdfPage() {
         isItalic: boolean;
       }
 
-      const fragments: RawFragment[] = [];
+      const wordFrags: WordFrag[] = [];
 
       for (const item of rawItems) {
         if (!item.str || !item.str.trim()) continue;
@@ -609,7 +770,7 @@ export default function EditPdfPage() {
             if (fObj?.name) realFontName += ` ${fObj.name}`;
           }
         } catch {
-          // Ignore if commonObjs is not populated
+          // Ignore
         }
 
         const { fontFamily, isBold, isItalic } = classifyPdfFontMetadata(
@@ -621,37 +782,17 @@ export default function EditPdfPage() {
           fObj
         );
 
-        const leadingListMatch = item.str.match(
-          /^(\s*(?:\d+[\.\)]|[a-zA-Z][\.\)]|[•●▪◦\-–—\*]))(\s{2,}|\t+)(.+)$/
-        );
-        if (leadingListMatch) {
-          const markerStr = leadingListMatch[1];
-          const gapSpaces = leadingListMatch[2];
-          const restStr = leadingListMatch[3];
-          const totalLen = Math.max(1, item.str.length);
-          const markerW = itemW * (markerStr.length / totalLen);
-          const gapW = Math.max(fontSize * 0.6, itemW * (gapSpaces.length / totalLen));
-          const restX = vx + markerW + gapW;
-          const restW = Math.max(fontSize, itemW - markerW - gapW);
+        const rawStr: string = item.str;
+        const tokenMatches = Array.from(rawStr.matchAll(/\S+/g));
+        const totalChars = Math.max(1, rawStr.length);
 
-          fragments.push({
-            text: markerStr.trim(),
+        if (tokenMatches.length <= 1) {
+          wordFrags.push({
+            text: rawStr.trim(),
             x: vx,
             yTop,
             baselineY: vBaselineY,
-            w: Math.max(markerW, fontSize * 0.6),
-            h: itemH,
-            fontSize,
-            fontFamily,
-            isBold,
-            isItalic,
-          });
-          fragments.push({
-            text: restStr,
-            x: restX,
-            yTop,
-            baselineY: vBaselineY,
-            w: restW,
+            w: Math.max(itemW, fontSize * 0.45),
             h: itemH,
             fontSize,
             fontFamily,
@@ -659,81 +800,69 @@ export default function EditPdfPage() {
             isItalic,
           });
         } else {
-          fragments.push({
-            text: item.str,
-            x: vx,
-            yTop,
-            baselineY: vBaselineY,
-            w: Math.max(itemW, fontSize * 0.5),
-            h: itemH,
-            fontSize,
-            fontFamily,
-            isBold,
-            isItalic,
-          });
+          for (const match of tokenMatches) {
+            const wordStr = match[0];
+            const startChar = match.index || 0;
+            const wordX = vx + (startChar / totalChars) * itemW;
+            const wordW = Math.max(
+              fontSize * 0.4,
+              (wordStr.length / totalChars) * itemW
+            );
+            wordFrags.push({
+              text: wordStr,
+              x: wordX,
+              yTop,
+              baselineY: vBaselineY,
+              w: wordW,
+              h: itemH,
+              fontSize,
+              fontFamily,
+              isBold,
+              isItalic,
+            });
+          }
         }
       }
 
-      fragments.sort((a, b) => {
+      wordFrags.sort((a, b) => {
         if (Math.abs(a.yTop - b.yTop) > Math.min(a.fontSize, b.fontSize) * 0.42) {
           return a.yTop - b.yTop;
         }
         return a.x - b.x;
       });
 
-      const listMarkerRegex = /^\s*(\d+[\.\)]|[a-zA-Z][\.\)]|[•●▪◦\-–—\*])\s*$/;
-      const mergedLines: RawFragment[] = [];
-
-      for (const frag of fragments) {
-        const last = mergedLines[mergedLines.length - 1];
-        const sameBaseline =
-          last &&
-          Math.abs(last.baselineY - frag.baselineY) <
-            Math.min(last.fontSize, frag.fontSize) * 0.42;
-        const gap = last ? frag.x - (last.x + last.w) : Infinity;
-
-        const isLastListMarker = Boolean(last && listMarkerRegex.test(last.text));
-        const isAdjacentPhrase =
-          last &&
-          !(isLastListMarker && gap > frag.fontSize * 0.2) &&
-          gap >= -frag.fontSize * 0.35 &&
-          gap < Math.max(last.fontSize, frag.fontSize) * 1.75 &&
-          Math.abs(last.fontSize - frag.fontSize) <= 2;
-
-        if (sameBaseline && isAdjacentPhrase) {
-          let spacer = "";
-          if (!last.text.endsWith(" ") && !frag.text.startsWith(" ")) {
-            if (gap > frag.fontSize * 0.55) {
-              const numSpaces = Math.min(6, Math.max(1, Math.round(gap / (frag.fontSize * 0.27))));
-              spacer = " ".repeat(numSpaces);
-            } else if (gap > frag.fontSize * 0.14) {
-              spacer = " ";
-            }
-          }
-          last.text += spacer + frag.text;
-          last.w = Math.max(last.w, frag.x + frag.w - last.x);
-          last.h = Math.max(last.h, frag.h);
-          if (frag.fontFamily === "serif") last.fontFamily = "serif";
+      const cleanWords: WordFrag[] = [];
+      for (const wf of wordFrags) {
+        const prev = cleanWords[cleanWords.length - 1];
+        const sameBase =
+          prev &&
+          Math.abs(prev.baselineY - wf.baselineY) <
+            Math.min(prev.fontSize, wf.fontSize) * 0.4;
+        const gap = prev ? wf.x - (prev.x + prev.w) : Infinity;
+        if (sameBase && prev && gap >= -wf.fontSize * 0.35 && gap <= wf.fontSize * 0.13) {
+          prev.text += wf.text;
+          prev.w = Math.max(prev.w, wf.x + wf.w - prev.x);
+          prev.h = Math.max(prev.h, wf.h);
         } else {
-          mergedLines.push({ ...frag });
+          cleanWords.push({ ...wf });
         }
       }
 
-      return mergedLines.map((ln, idx) => {
+      return cleanWords.map((wd, idx) => {
         let autoBgHex = "#ffffff";
         let autoFgHex = "#36383e";
-        let finalFontFamily: PdfFontFamily = ln.fontFamily;
-        let finalIsBold = ln.isBold;
+        let finalFontFamily: PdfFontFamily = wd.fontFamily;
+        let finalIsBold = wd.isBold;
 
         if (canvasCtx && canvasW && canvasH) {
           const sampled = sampleCanvasStyleForBox(
             canvasCtx,
             canvasW,
             canvasH,
-            ln.x * renderScale,
-            ln.yTop * renderScale,
-            ln.w * renderScale,
-            ln.h * renderScale
+            wd.x * renderScale,
+            wd.yTop * renderScale,
+            wd.w * renderScale,
+            wd.h * renderScale
           );
           autoBgHex = sampled.autoBgHex;
           autoFgHex = sampled.autoFgHex;
@@ -746,25 +875,25 @@ export default function EditPdfPage() {
         }
 
         const calibratedPt = calibrateFontSizePt(
-          ln.text,
-          ln.w,
-          ln.fontSize,
+          wd.text,
+          wd.w,
+          wd.fontSize,
           finalFontFamily,
           finalIsBold,
-          ln.isItalic
+          wd.isItalic
         );
 
-        const xPct = Math.max(0, Math.min(97, (ln.x / pageW) * 100));
-        const yPct = Math.max(0, Math.min(97, (ln.yTop / pageH) * 100));
-        const baseYPct = Math.max(0, Math.min(99, (ln.baselineY / pageH) * 100));
-        const wPct = Math.max(1.5, Math.min(100 - xPct, ((ln.w + 2) / pageW) * 100));
-        const hPct = Math.max(1.3, ((ln.h + 1.5) / pageH) * 100);
+        const xPct = Math.max(0, Math.min(98, (wd.x / pageW) * 100));
+        const yPct = Math.max(0, Math.min(98, (wd.yTop / pageH) * 100));
+        const baseYPct = Math.max(0, Math.min(99, (wd.baselineY / pageH) * 100));
+        const wPct = Math.max(0.8, Math.min(100 - xPct, ((wd.w + 1) / pageW) * 100));
+        const hPct = Math.max(1.3, ((wd.h + 1.5) / pageH) * 100);
 
         return {
-          id: `p${pageNum}_txt_${idx}`,
+          id: `p${pageNum}_w_${idx}`,
           pageNumber: pageNum,
-          originalText: ln.text,
-          currentText: ln.text,
+          originalText: wd.text,
+          currentText: wd.text,
           isNew: false,
           origXPercent: xPct,
           origYPercent: yPct,
@@ -779,7 +908,7 @@ export default function EditPdfPage() {
           fontFamily: finalFontFamily,
           color: autoFgHex,
           isBold: finalIsBold,
-          isItalic: ln.isItalic,
+          isItalic: wd.isItalic,
           textAlign: "left",
           maskBg: "auto",
           autoBgHex,
@@ -790,6 +919,45 @@ export default function EditPdfPage() {
     []
   );
 
+  useEffect(() => {
+    const pageWords = wordTokensByPage[currentPage];
+    if (!pageWords || pageWords.length === 0) return;
+
+    setTextBlocks((prev) => {
+      const otherPages = prev.filter((b) => b.pageNumber !== currentPage);
+      const modifiedOnCurrent = prev.filter(
+        (b) => b.pageNumber === currentPage && isBlockModified(b)
+      );
+
+      const uncoveredWords = pageWords.filter((w) => {
+        const wxCenter = w.origXPercent + w.origWidthPercent / 2;
+        const wyCenter = w.origYPercent + w.origHeightPercent / 2;
+        return !modifiedOnCurrent.some(
+          (m) =>
+            wxCenter >= m.origXPercent - 0.4 &&
+            wxCenter <= m.origXPercent + m.origWidthPercent + 0.4 &&
+            wyCenter >= m.origYPercent - 0.4 &&
+            wyCenter <= m.origYPercent + m.origHeightPercent + 0.4
+        );
+      });
+
+      const rebuilt = buildBlocksForGranularity(
+        uncoveredWords,
+        selectionGranularity,
+        pageBaseSizePt.width,
+        pageBaseSizePt.height
+      );
+      return [...otherPages, ...modifiedOnCurrent, ...rebuilt];
+    });
+  }, [
+    selectionGranularity,
+    currentPage,
+    wordTokensByPage,
+    pageBaseSizePt.width,
+    pageBaseSizePt.height,
+    buildBlocksForGranularity,
+  ]);
+
   const handleFileSelected = async (files: File[]) => {
     const selected = files[0];
     if (!selected) return;
@@ -799,11 +967,11 @@ export default function EditPdfPage() {
     setFile(selected);
     setCurrentPage(1);
     setTextBlocks([]);
+    setWordTokensByPage({});
     setHistoryPast([]);
     setHistoryFuture([]);
     setSelectedBlockId(null);
     extractedPagesRef.current = new Set();
-    colorSampledPagesRef.current = new Set();
 
     try {
       const pdfjs = await loadPdfJs();
@@ -816,23 +984,27 @@ export default function EditPdfPage() {
 
       if (pdf.numPages > 1) {
         (async () => {
-          const allOtherBlocks: TextBlockItem[] = [];
-          for (let p = 2; p <= Math.min(pdf.numPages, 50); p++) {
+          for (let p = 2; p <= Math.min(pdf.numPages, 40); p++) {
             if (extractedPagesRef.current.has(p)) continue;
             extractedPagesRef.current.add(p);
             try {
-              const pBlocks = await extractTextBlocksFromPage(pdf, p);
-              allOtherBlocks.push(...pBlocks);
+              const pg = await pdf.getPage(p);
+              const vp = pg.getViewport({ scale: 1.0 });
+              const pWords = await extractWordTokensFromPage(pdf, p);
+              const pLines = buildBlocksForGranularity(
+                pWords,
+                selectionGranularity,
+                vp.width,
+                vp.height
+              );
+              setWordTokensByPage((old) => ({ ...old, [p]: pWords }));
+              setTextBlocks((prev) => {
+                if (prev.some((b) => b.pageNumber === p)) return prev;
+                return [...prev, ...pLines];
+              });
             } catch {
-              // Ignore single-page extraction error
+              // Ignore single-page error
             }
-          }
-          if (allOtherBlocks.length > 0) {
-            setTextBlocks((prev) => {
-              const existingPages = new Set(prev.map((b) => b.pageNumber));
-              const filtered = allOtherBlocks.filter((b) => !existingPages.has(b.pageNumber));
-              return [...prev, ...filtered];
-            });
           }
         })();
       }
@@ -875,7 +1047,7 @@ export default function EditPdfPage() {
         const ow = (block.origWidthPercent / 100) * cw;
         const oh = (block.origHeightPercent / 100) * ch;
         ctx.fillStyle = maskHex;
-        ctx.fillRect(Math.max(0, ox - 1.5), Math.max(0, oy - 1), ow + 3, oh + 2);
+        ctx.fillRect(Math.max(0, ox - 1), Math.max(0, oy - 1), ow + 2, oh + 2);
       }
 
       const bx = (block.xPercent / 100) * cw;
@@ -894,17 +1066,25 @@ export default function EditPdfPage() {
         const fontPrefix = `${block.isItalic ? "italic " : ""}${block.isBold ? "bold " : ""}`;
         ctx.font = `${fontPrefix}${fontPx}px ${FONT_CSS_MAP[block.fontFamily]}`;
 
-        const measuredTextW = ctx.measureText(block.currentText).width + 4;
-        const fillW = Math.max(bw, measuredTextW);
+        const wrappedLines = wrapTextIntoLines(
+          ctx,
+          block.currentText,
+          bw,
+          block.isMultiline
+        );
+        const lineStepPx = (block.lineHeightPt || block.fontSizePt * 1.3) * RENDER_SCALE;
+        const maxLineW = Math.max(
+          bw,
+          ...wrappedLines.map((l) => ctx.measureText(l).width + 4)
+        );
+        const totalH =
+          wrappedLines.length > 1
+            ? (wrappedLines.length - 1) * lineStepPx + fontPx * 1.15
+            : Math.max(bh, fontPx * 1.08);
 
         if (maskHex !== "transparent") {
           ctx.fillStyle = maskHex;
-          ctx.fillRect(
-            Math.max(0, bx - 1.5),
-            Math.max(0, by - 0.5),
-            fillW + 3,
-            Math.max(bh, fontPx * 1.08) + 1
-          );
+          ctx.fillRect(Math.max(0, bx - 1), Math.max(0, by - 0.5), maxLineW + 2, totalH + 1);
         }
 
         const isRTL = /[\u0600-\u06FF]/.test(block.currentText);
@@ -913,20 +1093,23 @@ export default function EditPdfPage() {
         ctx.textBaseline = "alphabetic";
 
         const movedVertically = Math.abs(block.yPercent - block.origYPercent) > 0.1;
-        const baselineY = movedVertically
+        const firstBaselineY = movedVertically
           ? by + fontPx * 0.8
           : (block.origBaselineYPercent / 100) * ch;
 
-        if (isRTL || block.textAlign === "right") {
-          ctx.textAlign = "right";
-          ctx.fillText(block.currentText, bx + fillW - 2, baselineY);
-        } else if (block.textAlign === "center") {
-          ctx.textAlign = "center";
-          ctx.fillText(block.currentText, bx + fillW / 2, baselineY);
-        } else {
-          ctx.textAlign = "left";
-          ctx.fillText(block.currentText, bx, baselineY);
-        }
+        wrappedLines.forEach((lineText, idx) => {
+          const lineBaseY = firstBaselineY + idx * lineStepPx;
+          if (isRTL || block.textAlign === "right") {
+            ctx.textAlign = "right";
+            ctx.fillText(lineText, bx + maxLineW - 2, lineBaseY);
+          } else if (block.textAlign === "center") {
+            ctx.textAlign = "center";
+            ctx.fillText(lineText, bx + maxLineW / 2, lineBaseY);
+          } else {
+            ctx.textAlign = "left";
+            ctx.fillText(lineText, bx, lineBaseY);
+          }
+        });
       }
     }
   }, [textBlocks, currentPage, selectedBlockId, previewCleanMode]);
@@ -964,65 +1147,40 @@ export default function EditPdfPage() {
           }
         }
 
-        if (!extractedPagesRef.current.has(pageNum)) {
-          extractedPagesRef.current.add(pageNum);
-          colorSampledPagesRef.current.add(pageNum);
-          const pageBlocks = await extractTextBlocksFromPage(
-            pdfDocProxy,
-            pageNum,
-            offCtx,
-            offscreen.width,
-            offscreen.height,
-            RENDER_SCALE
+        const pageWords = await extractWordTokensFromPage(
+          pdfDocProxy,
+          pageNum,
+          offCtx,
+          offscreen.width,
+          offscreen.height,
+          RENDER_SCALE
+        );
+        extractedPagesRef.current.add(pageNum);
+        setWordTokensByPage((old) => ({ ...old, [pageNum]: pageWords }));
+
+        const builtBlocks = buildBlocksForGranularity(
+          pageWords,
+          selectionGranularity,
+          baseViewport.width,
+          baseViewport.height
+        );
+
+        setTextBlocks((old) => {
+          const modifiedOnPage = old.filter(
+            (b) => b.pageNumber === pageNum && isBlockModified(b)
           );
-          setTextBlocks((old) => [
-            ...old.filter((b) => b.pageNumber !== pageNum || b.isNew),
-            ...pageBlocks,
-          ]);
-        } else if (!colorSampledPagesRef.current.has(pageNum)) {
-          colorSampledPagesRef.current.add(pageNum);
-          setTextBlocks((old) =>
-            old.map((b) => {
-              if (b.pageNumber !== pageNum || b.isNew) return b;
-              const sampled = sampleCanvasStyleForBox(
-                offCtx,
-                offscreen.width,
-                offscreen.height,
-                (b.origXPercent / 100) * offscreen.width,
-                (b.origYPercent / 100) * offscreen.height,
-                (b.origWidthPercent / 100) * offscreen.width,
-                (b.origHeightPercent / 100) * offscreen.height
-              );
-              const nextFamily =
-                sampled.pixelIsSerif && b.fontFamily !== "mono" ? "serif" : b.fontFamily;
-              const nextBold = b.isBold || sampled.pixelIsBold;
-              const nextPt = calibrateFontSizePt(
-                b.originalText,
-                (b.origWidthPercent / 100) * baseViewport.width,
-                b.fontSizePt,
-                nextFamily,
-                nextBold,
-                b.isItalic
-              );
-              return {
-                ...b,
-                fontFamily: nextFamily,
-                isBold: nextBold,
-                fontSizePt: nextPt,
-                autoBgHex: sampled.autoBgHex,
-                customMaskHex: sampled.autoBgHex,
-                color: sampled.autoFgHex,
-              };
-            })
-          );
-        }
+          if (modifiedOnPage.length > 0) {
+            return old;
+          }
+          return [...old.filter((b) => b.pageNumber !== pageNum), ...builtBlocks];
+        });
       } catch (err) {
         console.error("Failed to render/extract PDF page:", err);
       } finally {
         setIsRenderingPage(false);
       }
     },
-    [pdfDocProxy, extractTextBlocksFromPage]
+    [pdfDocProxy, extractWordTokensFromPage, buildBlocksForGranularity, selectionGranularity]
   );
 
   useEffect(() => {
@@ -1053,32 +1211,125 @@ export default function EditPdfPage() {
     }
   }, []);
 
-  const handleCanvasDirectClick = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (previewCleanMode || !pdfCanvasRef.current) {
-      handleSelectBlock(null);
-      return;
-    }
+  /**
+   * Starts a Drag-to-Select Marquee when the user clicks and drags on the PDF page,
+   * allowing them to highlight and edit ANY exact amount of text (1 word, 3 words, or a paragraph)!
+   */
+  const handleViewportPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (previewCleanMode || !pdfCanvasRef.current) return;
+    if (e.button !== 0) return;
+
     const rect = pdfCanvasRef.current.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) return;
 
-    const clickXPct = ((e.clientX - rect.left) / rect.width) * 100;
-    const clickYPct = ((e.clientY - rect.top) / rect.height) * 100;
+    const xPct = ((e.clientX - rect.left) / rect.width) * 100;
+    const yPct = ((e.clientY - rect.top) / rect.height) * 100;
+    if (xPct < 0 || xPct > 100 || yPct < 0 || yPct > 100) return;
 
-    const pageBlocks = textBlocks.filter((b) => b.pageNumber === currentPage);
-    const hit = pageBlocks.find(
-      (b) =>
-        clickXPct >= b.xPercent - 0.6 &&
-        clickXPct <= b.xPercent + b.widthPercent + 0.6 &&
-        clickYPct >= b.yPercent - 0.5 &&
-        clickYPct <= b.yPercent + b.heightPercent + 0.5
-    );
-
-    if (hit) {
-      handleSelectBlock(hit);
-    } else {
-      handleSelectBlock(null);
-    }
+    setInteractionMode("marquee");
+    setMarqueeRect({ startX: xPct, startY: yPct, curX: xPct, curY: yPct });
   };
+
+  useEffect(() => {
+    if (interactionMode !== "marquee") return;
+
+    const handleMove = (e: PointerEvent) => {
+      if (!pdfCanvasRef.current) return;
+      const rect = pdfCanvasRef.current.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return;
+      const curX = Math.max(0, Math.min(100, ((e.clientX - rect.left) / rect.width) * 100));
+      const curY = Math.max(0, Math.min(100, ((e.clientY - rect.top) / rect.height) * 100));
+      setMarqueeRect((prev) => (prev ? { ...prev, curX, curY } : null));
+    };
+
+    const handleUp = () => {
+      setInteractionMode("none");
+      setMarqueeRect((rect) => {
+        if (!rect) return null;
+        const minX = Math.min(rect.startX, rect.curX);
+        const maxX = Math.max(rect.startX, rect.curX);
+        const minY = Math.min(rect.startY, rect.curY);
+        const maxY = Math.max(rect.startY, rect.curY);
+
+        if (maxX - minX < 1.2 && maxY - minY < 1.0) {
+          handleSelectBlock(null);
+          return null;
+        }
+
+        const pageWords = wordTokensByPage[currentPage] || [];
+        const selectedWords = pageWords.filter((w) => {
+          const cx = w.origXPercent + w.origWidthPercent / 2;
+          const cy = w.origYPercent + w.origHeightPercent / 2;
+          return cx >= minX && cx <= maxX && cy >= minY && cy <= maxY;
+        });
+
+        if (selectedWords.length === 0) {
+          return null;
+        }
+
+        const sorted = [...selectedWords].sort((a, b) => {
+          if (Math.abs(a.origBaselineYPercent - b.origBaselineYPercent) > 0.8) {
+            return a.origBaselineYPercent - b.origBaselineYPercent;
+          }
+          return a.origXPercent - b.origXPercent;
+        });
+
+        const lineTexts: string[] = [];
+        let curLineWords: TextBlockItem[] = [];
+        for (const sw of sorted) {
+          const prevW = curLineWords[curLineWords.length - 1];
+          if (prevW && Math.abs(prevW.origBaselineYPercent - sw.origBaselineYPercent) > 0.8) {
+            lineTexts.push(curLineWords.map((x) => x.originalText).join(" "));
+            curLineWords = [sw];
+          } else {
+            curLineWords.push(sw);
+          }
+        }
+        if (curLineWords.length > 0) {
+          lineTexts.push(curLineWords.map((x) => x.originalText).join(" "));
+        }
+
+        const combinedText = lineTexts.join("\n");
+        const firstWord = sorted[0];
+        const boxLeft = Math.min(...sorted.map((w) => w.origXPercent));
+        const boxTop = Math.min(...sorted.map((w) => w.origYPercent));
+        const boxRight = Math.max(...sorted.map((w) => w.origXPercent + w.origWidthPercent));
+        const boxBottom = Math.max(...sorted.map((w) => w.origYPercent + w.origHeightPercent));
+        const boxW = Math.max(2, boxRight - boxLeft);
+        const boxH = Math.max(1.4, boxBottom - boxTop);
+
+        const customId = `custom_sel_${Date.now()}`;
+        const customBlock: TextBlockItem = {
+          ...firstWord,
+          id: customId,
+          originalText: combinedText,
+          currentText: combinedText,
+          isMultiline: lineTexts.length > 1,
+          lineHeightPt: Math.round(firstWord.fontSizePt * 1.32 * 10) / 10,
+          origXPercent: boxLeft,
+          origYPercent: boxTop,
+          origBaselineYPercent: firstWord.origBaselineYPercent,
+          origWidthPercent: boxW,
+          origHeightPercent: boxH,
+          xPercent: boxLeft,
+          yPercent: boxTop,
+          widthPercent: boxW,
+          heightPercent: boxH,
+        };
+
+        setTextBlocks((prev) => [...prev, customBlock]);
+        handleSelectBlock(customBlock);
+        return null;
+      });
+    };
+
+    window.addEventListener("pointermove", handleMove);
+    window.addEventListener("pointerup", handleUp);
+    return () => {
+      window.removeEventListener("pointermove", handleMove);
+      window.removeEventListener("pointerup", handleUp);
+    };
+  }, [interactionMode, currentPage, wordTokensByPage, handleSelectBlock]);
 
   const handleUpdateBlock = useCallback(
     (id: string, patch: Partial<TextBlockItem>, recordHistory: boolean = true) => {
@@ -1295,7 +1546,7 @@ export default function EditPdfPage() {
   };
 
   useEffect(() => {
-    if (interactionMode === "none") return;
+    if (interactionMode !== "drag" && interactionMode !== "resize") return;
 
     const handleMove = (e: PointerEvent) => {
       if (!interactionRef.current || !pdfCanvasRef.current) return;
@@ -1356,9 +1607,21 @@ export default function EditPdfPage() {
     const fontSpec = `${fontStylePrefix}${fontPx}px ${FONT_CSS_MAP[block.fontFamily]}`;
     mCtx.font = fontSpec;
 
-    const measuredW = mCtx.measureText(block.currentText).width + 4 * SCALE;
+    const wrappedLines = wrapTextIntoLines(
+      mCtx,
+      block.currentText,
+      boxWidthPt * SCALE,
+      block.isMultiline
+    );
+    const lineStepPx = (block.lineHeightPt || block.fontSizePt * 1.3) * SCALE;
+    const measuredW = Math.max(
+      ...wrappedLines.map((l) => mCtx.measureText(l).width + 4 * SCALE)
+    );
     const finalW = Math.max(boxWidthPt * SCALE, measuredW);
-    const finalH = Math.max(boxHeightPt * SCALE, fontPx * 1.12);
+    const finalH =
+      wrappedLines.length > 1
+        ? (wrappedLines.length - 1) * lineStepPx + fontPx * 1.18
+        : Math.max(boxHeightPt * SCALE, fontPx * 1.12);
 
     const canvas = document.createElement("canvas");
     canvas.width = Math.max(1, Math.ceil(finalW));
@@ -1373,18 +1636,21 @@ export default function EditPdfPage() {
     ctx.fillStyle = block.color;
     ctx.textBaseline = "alphabetic";
 
-    const baselineY = fontPx * 0.8;
+    const firstBaselineY = fontPx * 0.8;
 
-    if (isRTL || block.textAlign === "right") {
-      ctx.textAlign = "right";
-      ctx.fillText(block.currentText, canvas.width - 2 * SCALE, baselineY);
-    } else if (block.textAlign === "center") {
-      ctx.textAlign = "center";
-      ctx.fillText(block.currentText, canvas.width / 2, baselineY);
-    } else {
-      ctx.textAlign = "left";
-      ctx.fillText(block.currentText, 0, baselineY);
-    }
+    wrappedLines.forEach((lineText, idx) => {
+      const baselineY = firstBaselineY + idx * lineStepPx;
+      if (isRTL || block.textAlign === "right") {
+        ctx.textAlign = "right";
+        ctx.fillText(lineText, canvas.width - 2 * SCALE, baselineY);
+      } else if (block.textAlign === "center") {
+        ctx.textAlign = "center";
+        ctx.fillText(lineText, canvas.width / 2, baselineY);
+      } else {
+        ctx.textAlign = "left";
+        ctx.fillText(lineText, 0, baselineY);
+      }
+    });
 
     const dataUrl = canvas.toDataURL("image/png");
     return {
@@ -1539,7 +1805,16 @@ export default function EditPdfPage() {
               const baseLine = movedV
                 ? (b.yPercent / 100) * cnv.height + fPx * 0.8
                 : (b.origBaselineYPercent / 100) * cnv.height;
-              ctx.fillText(b.currentText, (b.xPercent / 100) * cnv.width, baseLine);
+              const wrapped = wrapTextIntoLines(
+                ctx,
+                b.currentText,
+                (b.widthPercent / 100) * cnv.width,
+                b.isMultiline
+              );
+              const stepPx = (b.lineHeightPt || b.fontSizePt * 1.3) * 2.0;
+              wrapped.forEach((lnText, idx) => {
+                ctx.fillText(lnText, (b.xPercent / 100) * cnv.width, baseLine + idx * stepPx);
+              });
             }
           }
 
@@ -1575,17 +1850,17 @@ export default function EditPdfPage() {
   return (
     <ToolLayout
       title="Edit PDF Text Online"
-      description="Click any existing text in your PDF to edit or replace it in-place with automatic font, size, and optical ink-color matching. Includes Find & Replace, Undo/Redo, freeform text, and redaction—100% private in your browser."
+      description="Drag-select any exact words, lines, or paragraphs in your PDF to edit or replace them in-place with automatic font, size, and optical ink-color matching—100% private in your browser."
       faqs={[
+        {
+          question: "How do I edit just one word, a few words, or a whole paragraph?",
+          answer:
+            "You can either drag a selection box over the exact words or paragraph you want to edit on the page, or use the Selection Mode switcher ('Word', 'Line', or 'Paragraph') in the top toolbar to choose how much text is highlighted when you hover.",
+        },
         {
           question: "How does automatic font and ink darkness matching work?",
           answer:
             "Our engine inspects both the embedded PDF font table (supporting LaTeX Computer Modern, Times/Serif, Calibri, Arial, and Courier) and the rendered glyph pixels on the page to match exact font family, decimal point size, baseline, and optical stroke shade.",
-        },
-        {
-          question: "Can I Find and Replace words across the entire PDF?",
-          answer:
-            "Yes! Use the Find & Replace bar at the top to type any word, title, date, or number and replace it on the current page or across all pages in one click with matching typography.",
         },
         {
           question: "Does this PDF text editor support French accents, Arabic, and Cyrillic?",
@@ -1601,7 +1876,7 @@ export default function EditPdfPage() {
             multiple={false}
             onFilesSelected={handleFileSelected}
             title="Drop a PDF document to edit existing text"
-            description="Click any title, sentence, date, or number inside your PDF to replace it in-place with auto-matched fonts and optical ink colors."
+            description="Drag over any exact words or paragraphs—or hover by Word, Line, or Paragraph—to edit in-place with matched fonts and ink colors."
           />
         )}
 
@@ -1620,7 +1895,7 @@ export default function EditPdfPage() {
                   <p className="font-mono text-xs text-slate-500 dark:text-slate-400">
                     Page {currentPage} of {totalPages} •{" "}
                     <span className="text-rose-600 dark:text-rose-400 font-bold">
-                      {detectedExistingLinesOnPage} existing text lines
+                      {detectedExistingLinesOnPage} selectable {selectionGranularity}s
                     </span>
                     {modifiedBlocks.length > 0 && (
                       <span className="ml-1.5 text-emerald-600 dark:text-emerald-400 font-bold">
@@ -1632,6 +1907,40 @@ export default function EditPdfPage() {
               </div>
 
               <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
+                {/* Smart Selection Granularity Switcher: Word | Line | Paragraph */}
+                <div
+                  className="inline-flex items-center rounded-xl border border-slate-200 bg-white p-0.5 text-xs dark:border-slate-800 dark:bg-slate-900"
+                  title="Choose how much text is selected on hover (or drag a box over any custom amount of text!)"
+                >
+                  <span className="hidden lg:inline-flex items-center gap-1 px-2 text-[11px] font-semibold text-slate-400">
+                    <MousePointerClick className="h-3.5 w-3.5 text-rose-600" />
+                    <span>Select:</span>
+                  </span>
+                  {(
+                    [
+                      { id: "word", label: "Word" },
+                      { id: "line", label: "Line" },
+                      { id: "paragraph", label: "Paragraph" },
+                    ] as const
+                  ).map((mode) => (
+                    <button
+                      key={mode.id}
+                      type="button"
+                      onClick={() => {
+                        setSelectionGranularity(mode.id);
+                        handleSelectBlock(null);
+                      }}
+                      className={`rounded-lg px-2.5 py-1.5 text-xs font-bold transition-colors ${
+                        selectionGranularity === mode.id
+                          ? "bg-rose-600 text-white shadow-2xs"
+                          : "text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800"
+                      }`}
+                    >
+                      {mode.label}
+                    </button>
+                  ))}
+                </div>
+
                 <div className="inline-flex items-center rounded-xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900 p-0.5">
                   <button
                     type="button"
@@ -1728,6 +2037,7 @@ export default function EditPdfPage() {
                   onClick={() => {
                     setFile(null);
                     setTextBlocks([]);
+                    setWordTokensByPage({});
                     handleSelectBlock(null);
                   }}
                   className="inline-flex items-center gap-1 rounded-xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900 px-2.5 py-2 text-xs font-semibold text-slate-600 dark:text-slate-300 hover:bg-slate-50 transition-colors"
@@ -1752,7 +2062,7 @@ export default function EditPdfPage() {
                       type="text"
                       value={findQuery}
                       onChange={(e) => setFindQuery(e.target.value)}
-                      placeholder="Click a line or type text to find..."
+                      placeholder="Click text or type to find..."
                       className="w-full bg-transparent text-xs text-slate-900 dark:text-white outline-none"
                     />
                     {findQuery && (
@@ -1831,37 +2141,49 @@ export default function EditPdfPage() {
               </div>
             )}
 
-            {/* Selected Line Quick-Replace & Typography Inspector */}
+            {/* Selected Text Quick-Replace & Typography Inspector */}
             {selectedBlock ? (
               <div className="space-y-2.5 rounded-xl border border-rose-200 bg-rose-50/80 p-3.5 text-xs dark:border-rose-900/50 dark:bg-rose-950/30">
                 {!selectedBlock.isWhiteoutOnly && (
                   <div className="flex flex-wrap items-center justify-between gap-2 border-b border-rose-200/70 pb-2.5 dark:border-rose-900/40">
                     <div className="flex flex-wrap items-center gap-2 flex-1">
                       <span className="font-bold text-rose-700 dark:text-rose-300 shrink-0">
-                        Selected Line Edit:
+                        Selected Text:
                       </span>
 
                       <div className="flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 flex-1 min-w-[240px] dark:border-slate-700 dark:bg-slate-900">
-                        <span className="text-[10px] font-mono uppercase text-slate-400 shrink-0">
-                          Full Text:
-                        </span>
-                        <input
-                          type="text"
-                          value={selectedBlock.currentText}
-                          onChange={(e) => {
-                            const val = e.target.value;
-                            handleUpdateBlock(selectedBlock.id, { currentText: val });
-                            setSelectedReplaceSubstr(val);
-                            setReplaceQuery(val);
-                          }}
-                          onKeyDown={(e) => {
-                            if (e.key === "Enter") {
-                              handleSelectBlock(null);
-                            }
-                          }}
-                          placeholder="Type new text for this line..."
-                          className="w-full bg-transparent text-xs font-medium text-slate-900 dark:text-white outline-none"
-                        />
+                        {selectedBlock.isMultiline ? (
+                          <textarea
+                            rows={2}
+                            value={selectedBlock.currentText}
+                            onChange={(e) => {
+                              const val = e.target.value;
+                              handleUpdateBlock(selectedBlock.id, { currentText: val });
+                              setSelectedReplaceSubstr(val);
+                              setReplaceQuery(val);
+                            }}
+                            placeholder="Type replacement paragraph text..."
+                            className="w-full bg-transparent text-xs font-medium text-slate-900 dark:text-white outline-none resize-y"
+                          />
+                        ) : (
+                          <input
+                            type="text"
+                            value={selectedBlock.currentText}
+                            onChange={(e) => {
+                              const val = e.target.value;
+                              handleUpdateBlock(selectedBlock.id, { currentText: val });
+                              setSelectedReplaceSubstr(val);
+                              setReplaceQuery(val);
+                            }}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") {
+                                handleSelectBlock(null);
+                              }
+                            }}
+                            placeholder="Type new text..."
+                            className="w-full bg-transparent text-xs font-medium text-slate-900 dark:text-white outline-none"
+                          />
+                        )}
                       </div>
 
                       <button
@@ -2084,7 +2406,7 @@ export default function EditPdfPage() {
                       className="inline-flex items-center gap-1 rounded-lg border border-red-200 bg-red-50 px-2.5 py-1 font-semibold text-red-600 hover:bg-red-100"
                     >
                       <Trash2 className="h-3 w-3" />
-                      <span>{selectedBlock.isNew ? "Delete Box" : "Blank Out Line"}</span>
+                      <span>{selectedBlock.isNew ? "Delete Box" : "Blank Out"}</span>
                     </button>
                   </div>
                 </div>
@@ -2094,8 +2416,8 @@ export default function EditPdfPage() {
                 <span className="flex items-center gap-2 font-medium">
                   <Sparkles className="h-4 w-4 text-rose-600 shrink-0" />
                   <span>
-                    Click any title, line, or paragraph on the PDF below to edit it in-place, or
-                    use <strong>Find & Replace</strong> above.
+                    <strong>Drag a box over any exact words</strong> you want to edit, or hover by{" "}
+                    <strong>Word / Line / Paragraph</strong> using the top selector.
                   </span>
                 </span>
 
@@ -2149,10 +2471,10 @@ export default function EditPdfPage() {
               </div>
             )}
 
-            {/* Interactive PDF Page Viewport */}
+            {/* Interactive PDF Page Viewport (Supports Click-on-Hover AND Drag-Marquee Selection!) */}
             <div
-              onClick={handleCanvasDirectClick}
-              className="relative block overflow-auto rounded-2xl border border-slate-200 bg-slate-100 p-4 max-h-[82vh] dark:border-slate-800 dark:bg-slate-950"
+              onPointerDown={handleViewportPointerDown}
+              className="relative block overflow-auto rounded-2xl border border-slate-200 bg-slate-100 p-4 max-h-[82vh] cursor-crosshair dark:border-slate-800 dark:bg-slate-950"
             >
               {isRenderingPage && (
                 <div className="absolute inset-0 z-30 flex items-center justify-center bg-white/60 dark:bg-slate-950/60 backdrop-blur-2xs">
@@ -2170,6 +2492,19 @@ export default function EditPdfPage() {
               >
                 <canvas ref={pdfCanvasRef} className="block w-full h-auto rounded-xs" />
 
+                {/* Live Drag-to-Select Marquee Rectangle */}
+                {marqueeRect && (
+                  <div
+                    style={{
+                      left: `${Math.min(marqueeRect.startX, marqueeRect.curX)}%`,
+                      top: `${Math.min(marqueeRect.startY, marqueeRect.curY)}%`,
+                      width: `${Math.abs(marqueeRect.curX - marqueeRect.startX)}%`,
+                      height: `${Math.abs(marqueeRect.curY - marqueeRect.startY)}%`,
+                    }}
+                    className="pointer-events-none absolute z-40 border-2 border-rose-600 bg-rose-500/15 rounded-xs"
+                  />
+                )}
+
                 {currentPageBlocks.map((block) => {
                   const isSelected = !previewCleanMode && selectedBlockId === block.id;
                   const isModified = isBlockModified(block);
@@ -2186,6 +2521,8 @@ export default function EditPdfPage() {
 
                   const maskHex = resolveMaskHex(block);
                   const scaledFontPx = Math.max(8.5, block.fontSizePt * displayScale);
+                  const scaledLineHeightPx =
+                    (block.lineHeightPt || block.fontSizePt * 1.3) * displayScale;
 
                   return (
                     <div
@@ -2195,8 +2532,11 @@ export default function EditPdfPage() {
                         handleSelectBlock(block);
                       }}
                       onPointerDown={(e) => {
-                        if (block.isWhiteoutOnly) {
-                          handleStartInteraction(block, "drag", e);
+                        if (block.isWhiteoutOnly || isSelected) {
+                          e.stopPropagation();
+                          if (block.isWhiteoutOnly) {
+                            handleStartInteraction(block, "drag", e);
+                          }
                         }
                       }}
                       style={{
@@ -2216,7 +2556,7 @@ export default function EditPdfPage() {
                               ? "flex-end"
                               : "flex-start",
                       }}
-                      className={`group absolute flex items-center transition-shadow rounded-xs ${
+                      className={`group absolute flex items-start transition-shadow rounded-xs ${
                         isSelected
                           ? "z-30 ring-2 ring-rose-600 shadow-md"
                           : isFindHit
@@ -2250,6 +2590,28 @@ export default function EditPdfPage() {
                         <div className="w-full h-full min-h-[16px] cursor-move flex items-center justify-center text-[9px] font-mono text-slate-400">
                           {isSelected ? "Drag or Resize Mask" : ""}
                         </div>
+                      ) : isSelected && block.isMultiline ? (
+                        <textarea
+                          autoFocus
+                          rows={Math.max(2, block.currentText.split("\n").length)}
+                          value={block.currentText}
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            handleUpdateBlock(block.id, { currentText: val });
+                            setSelectedReplaceSubstr(val);
+                            setReplaceQuery(val);
+                          }}
+                          style={{
+                            color: block.color,
+                            fontFamily: FONT_CSS_MAP[block.fontFamily],
+                            fontWeight: block.isBold ? 700 : 400,
+                            fontStyle: block.isItalic ? "italic" : "normal",
+                            fontSize: `${scaledFontPx}px`,
+                            lineHeight: `${scaledLineHeightPx}px`,
+                            textAlign: block.textAlign,
+                          }}
+                          className="w-full min-w-full bg-transparent outline-none px-0.5 resize-none antialiased"
+                        />
                       ) : isSelected ? (
                         <div className="inline-grid w-full items-center">
                           <span
@@ -2304,11 +2666,11 @@ export default function EditPdfPage() {
                           }}
                           className="invisible whitespace-pre px-1 pointer-events-none select-none leading-none"
                         >
-                          {block.currentText || " "}
+                          {block.currentText.split("\n")[0] || " "}
                         </span>
                       ) : (
                         <span
-                          title={`Click to edit: "${block.currentText}" (${block.fontFamily}, ${block.fontSizePt}pt)`}
+                          title={`Click to edit ${selectionGranularity}: "${block.currentText}"`}
                           className="w-full h-full block opacity-0 group-hover:opacity-100 text-[9px] font-mono bg-rose-600 text-white px-1 rounded-xs pointer-events-none truncate max-w-[90px]"
                         >
                           Edit
@@ -2340,10 +2702,10 @@ export default function EditPdfPage() {
                 <span>
                   {modifiedBlocks.length > 0
                     ? `${modifiedBlocks.length} text change(s) applied live on page and ready to download.`
-                    : "Click any text on the PDF page above or use Find & Replace to modify it."}
+                    : "Drag over any exact words to edit just that selection, or click any Word / Line / Paragraph."}
                 </span>
                 <span className="hidden md:inline font-mono text-[11px] text-slate-400">
-                  • Shortcuts: Enter Apply • Ctrl+Z Undo • Ctrl+F Find & Replace
+                  • Shortcuts: Drag = Select Custom Amount • Enter = Apply • Ctrl+Z = Undo
                 </span>
               </div>
 
