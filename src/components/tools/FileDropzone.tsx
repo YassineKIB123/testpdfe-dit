@@ -80,6 +80,17 @@ export function FileDropzone({
     [accept, multiple, onFilesSelected, validateFile]
   );
 
+  // Automatically pick up any file dropped on the Homepage Hero Dropzone!
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const win = window as any;
+    if (win.__pdfStudioPendingFiles && win.__pdfStudioPendingFiles.length > 0) {
+      const pending = win.__pdfStudioPendingFiles as File[];
+      win.__pdfStudioPendingFiles = null;
+      processFiles(pending);
+    }
+  }, [processFiles]);
+
   const handleDragOver = (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
     e.stopPropagation();
