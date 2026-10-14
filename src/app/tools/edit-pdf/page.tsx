@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useRef, useEffect, useCallback } from "react";
+import React, { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import Link from "next/link";
 import { ToolLayout } from "@/components/tools/ToolLayout";
 import { FileDropzone } from "@/components/tools/FileDropzone";
@@ -61,13 +61,13 @@ export interface TextBlockItem {
   yPercent: number;
   widthPercent: number;
   heightPercent: number;
-  // Saved original typography (locked when extracted so editing text never mutates size/style)
+  // Locked original typography from the PDF
   origFontSizePt: number;
   origFontFamily: PdfFontFamily;
   origColor: string;
   origIsBold: boolean;
   origIsItalic: boolean;
-  // Current active typography
+  // Active typography
   fontSizePt: number;
   fontFamily: PdfFontFamily;
   color: string;
@@ -83,8 +83,8 @@ const FONT_CSS_MAP: Record<PdfFontFamily, string> = {
   serif:
     '"Computer Modern Serif", "Latin Modern Roman", "Times New Roman", Times, Georgia, Cambria, serif',
   calibri: 'Calibri, Carlito, "Segoe UI", Candara, Arial, sans-serif',
-  sans: 'Arial, Helvetica, "Liberation Sans", system-ui, sans-serif',
-  mono: '"Courier New", Courier, Consolas, Menlo, monospace',
+  sans: '"Computer Modern Sans", Arial, Helvetica, "Liberation Sans", system-ui, sans-serif',
+  mono: '"Computer Modern Typewriter", "Courier New", Courier, Consolas, Menlo, monospace',
 };
 
 const RENDER_SCALE = 1.6;
@@ -174,8 +174,8 @@ function detectDocumentDefaultFontFromBytes(buffer: ArrayBuffer): PdfFontFamily 
 }
 
 /**
- * Determines fontFamily, isBold, and isItalic strictly from the PDF's actual font descriptor
- * and font name table (never guessing Bold from pixel darkness so regular text never turns Bold!).
+ * Classifies PDF font metadata after stripping 6-letter subset prefixes (e.g. "ABCDEF+SFRM1000")
+ * and avoiding numeric false positives ("700"/"800"/"900" in CM-Super font names).
  */
 function classifyPdfFontMetadata(
   realFontName: string,
@@ -185,97 +185,59 @@ function classifyPdfFontMetadata(
   docDefaultFamily: PdfFontFamily,
   fObj?: any
 ): { fontFamily: PdfFontFamily; isBold: boolean; isItalic: boolean } {
-  const lowerName = realFontName.toLowerCase();
+  // Strip 6-uppercase-letter PDF subset tags like "X700AB+"
+  const cleanedName = realFontName
+    .replace(/\b[A-Z]{6}\+/g, "")
+    .replace(/\bg_d\d+_f\d+\b/gi, "")
+    .toLowerCase();
   const lowerStyle = fallbackStyleFamily.toLowerCase();
 
   let fontFamily: PdfFontFamily = docDefaultFamily;
 
   if (
     Boolean(fObj?.isMonospace) ||
-    /mono|courier|consolas|menlo|fixed|typewriter|code|cmtt|sftt|lmmono/.test(lowerName) ||
+    /mono|courier|consolas|menlo|fixed|typewriter|code|cmtt|sftt|lmmono/.test(cleanedName) ||
     lowerStyle === "monospace"
   ) {
     fontFamily = "mono";
   } else if (
     Boolean(fObj?.isSerifFont) ||
     (/serif|times|georgia|garamond|cambria|palatino|mincho|baskerville|cmr|cmbx|cmti|cmsl|cmcsc|cmmi|sfrm|sfbx|sfti|sfsl|sfcsc|lmroman|nimbusrom|termes|pagella|bonum|schola|libertine|libertinus|charter|bookman|century|utopia|fourier|stix|xits|crimson|merriweather|bodoni|caslon|didot|constantia/.test(
-      lowerName
+      cleanedName
     ) &&
-      !/sans|cmss|sfss|lmsans/.test(lowerName)) ||
+      !/sans|cmss|sfss|lmsans/.test(cleanedName)) ||
     lowerStyle === "serif"
   ) {
     fontFamily = "serif";
-  } else if (/calibri|carlito|aptos|candara|corbel|segoe/.test(lowerName)) {
+  } else if (/calibri|carlito|aptos|candara|corbel|segoe/.test(cleanedName)) {
     fontFamily = "calibri";
   } else if (
     /arial|helvetica|inter|roboto|tahoma|verdana|cmss|sfss|lmsans|dejavusans|liberationsans/.test(
-      lowerName
+      cleanedName
     )
   ) {
     fontFamily = "sans";
   }
 
   const isBold =
-    Boolean(fObj?.bold || fObj?.black) ||
-    /bold|black|heavy|demi|semibold|extrabold|-bd|cmbx|sfbx|lmroman.*bold|nimbusrom.*medi|-medi|700|800|900/.test(
-      lowerName
+    /(?:^|[-_\s])(bold|black|heavy|demi|semibold|extrabold)|-bd\b|cmbx|sfbx|lmroman.*bold|nimbusrom.*(bold|medi)/i.test(
+      cleanedName
     );
 
   const isItalic =
     Boolean(fObj?.italic) ||
-    /italic|oblique|slanted|-it|cmti|sfti|cmsl|sfsl|cmmi|lmroman.*italic/.test(lowerName) ||
+    /italic|oblique|slanted|-it\b|cmti|sfti|cmsl|sfsl|cmmi|lmroman.*italic/.test(cleanedName) ||
     Math.abs(transformShear) > 0.08 * fontSize;
 
   return { fontFamily, isBold, isItalic };
 }
 
 /**
- * Gently calibrates fontSizePt on full lines (>= 10 chars) against the exact PDF line width
- * with a tight [0.91x .. 1.02x] clamp so the original PDF font size is faithfully preserved.
- */
-function calibrateLineFontSizePt(
-  text: string,
-  targetWidthPt: number,
-  rawFontSizePt: number,
-  fontFamily: PdfFontFamily,
-  isBold: boolean,
-  isItalic: boolean
-): number {
-  const exactRaw = Math.round(rawFontSizePt * 10) / 10;
-  const firstLine = (text || "").split("\n")[0];
-  if (
-    !firstLine ||
-    firstLine.trim().length < 10 ||
-    targetWidthPt <= 25 ||
-    typeof document === "undefined"
-  ) {
-    return exactRaw;
-  }
-  try {
-    const c = document.createElement("canvas");
-    const ctx = c.getContext("2d");
-    if (!ctx) return exactRaw;
-    const testPx = 100;
-    const prefix = `${isItalic ? "italic " : ""}${isBold ? "bold " : ""}`;
-    ctx.font = `${prefix}${testPx}px ${FONT_CSS_MAP[fontFamily]}`;
-    const measuredAt100 = ctx.measureText(firstLine).width;
-    if (measuredAt100 <= 0) return exactRaw;
-
-    const widthMatchedPt = (targetWidthPt / measuredAt100) * testPx;
-    const clamped = Math.max(
-      rawFontSizePt * 0.91,
-      Math.min(rawFontSizePt * 1.02, widthMatchedPt)
-    );
-    return Math.round(clamped * 10) / 10;
-  } catch {
-    return exactRaw;
-  }
-}
-
-/**
- * Samples the rendered PDF canvas for background color (`autoBgHex`), optical ink color (`autoFgHex`),
- * and horizontal baseline Serif-foot ratio (`pixelIsSerif`).
- * Never overrides `isBold` from pixels so regular text never turns Bold!
+ * Samples the rendered PDF canvas for:
+ * 1) Background paper color (`autoBgHex`)
+ * 2) Optical ink color (`autoFgHex`) calibrated to match the actual stroke density of the PDF glyphs
+ * 3) Horizontal stem-width measurement (`pixelIsThinRegular`, `pixelIsThickBold`) so regular 1px-stem text
+ *    is guaranteed never to become Bold, while true thick-stemmed headings stay Bold.
  */
 function sampleCanvasStyleForBox(
   ctx: CanvasRenderingContext2D,
@@ -284,8 +246,15 @@ function sampleCanvasStyleForBox(
   boxXPx: number,
   boxYPx: number,
   boxWPx: number,
-  boxHPx: number
-): { autoBgHex: string; autoFgHex: string; pixelIsSerif: boolean } {
+  boxHPx: number,
+  fontPx: number
+): {
+  autoBgHex: string;
+  autoFgHex: string;
+  pixelIsSerif: boolean;
+  pixelIsThinRegular: boolean;
+  pixelIsThickBold: boolean;
+} {
   try {
     const pad = 2;
     const sx = Math.max(0, Math.floor(boxXPx - pad));
@@ -296,8 +265,10 @@ function sampleCanvasStyleForBox(
     if (sw <= 3 || sh <= 3) {
       return {
         autoBgHex: "#ffffff",
-        autoFgHex: "#22252a",
+        autoFgHex: "#2e3138",
         pixelIsSerif: false,
+        pixelIsThinRegular: true,
+        pixelIsThickBold: false,
       };
     }
 
@@ -330,8 +301,10 @@ function sampleCanvasStyleForBox(
 
     const inkPixels: { r: number; g: number; b: number; dist: number }[] = [];
     const rowInkCounts: number[] = new Array(sh).fill(0);
+    const horizontalRuns: number[] = [];
 
     for (let y = 1; y < sh - 1; y++) {
+      let currentRun = 0;
       for (let x = 1; x < sw - 1; x++) {
         const idx = (y * sw + x) * 4;
         const r = imgData[idx];
@@ -342,16 +315,39 @@ function sampleCanvasStyleForBox(
           inkPixels.push({ r, g, b, dist });
           rowInkCounts[y]++;
         }
+        if (dist > 105) {
+          currentRun++;
+        } else if (currentRun > 0) {
+          horizontalRuns.push(currentRun);
+          currentRun = 0;
+        }
+      }
+      if (currentRun > 0) {
+        horizontalRuns.push(currentRun);
       }
     }
 
     if (inkPixels.length === 0) {
       return {
         autoBgHex: rgbToHex(bgR, bgG, bgB),
-        autoFgHex: "#22252a",
+        autoFgHex: "#2e3138",
         pixelIsSerif: false,
+        pixelIsThinRegular: true,
+        pixelIsThickBold: false,
       };
     }
+
+    // Measure horizontal stem run lengths to distinguish thin Regular stems (~1.5px) from Bold stems (~2.3px+)
+    let meanRun = 1.5;
+    let medianRun = 1.0;
+    if (horizontalRuns.length >= 4) {
+      horizontalRuns.sort((a, b) => a - b);
+      meanRun = horizontalRuns.reduce((a, b) => a + b, 0) / horizontalRuns.length;
+      medianRun = horizontalRuns[Math.floor(horizontalRuns.length * 0.5)];
+    }
+
+    const pixelIsThinRegular = medianRun <= 1.2 && meanRun < Math.max(1.88, fontPx * 0.118);
+    const pixelIsThickBold = medianRun >= 2.0 && meanRun >= Math.max(2.15, fontPx * 0.132);
 
     inkPixels.sort((a, b) => b.dist - a.dist);
 
@@ -360,8 +356,9 @@ function sampleCanvasStyleForBox(
       Math.max(topPixel.r, topPixel.g, topPixel.b) -
       Math.min(topPixel.r, topPixel.g, topPixel.b);
 
-    const startRatio = colorSat > 35 ? 0.05 : 0.15;
-    const endRatio = colorSat > 35 ? 0.30 : 0.42;
+    // Sample the 20th..50th percentile of ink pixels so anti-aliased thin serif stems match optical grayness
+    const startRatio = colorSat > 35 ? 0.05 : 0.20;
+    const endRatio = colorSat > 35 ? 0.30 : 0.50;
     const startIdx = Math.floor(inkPixels.length * startRatio);
     const endIdx = Math.max(startIdx + 1, Math.floor(inkPixels.length * endRatio));
 
@@ -378,11 +375,13 @@ function sampleCanvasStyleForBox(
     let fgG = sumG / count;
     let fgB = sumB / count;
 
-    // Keep standard dark-on-light text in a natural PDF ink range (#1c1e22 .. #32353b)
     const bgLum = (bgR + bgG + bgB) / 3;
     const fgLum = (fgR + fgG + fgB) / 3;
     if (bgLum > 200 && colorSat <= 30) {
-      const clampedLum = Math.max(24, Math.min(48, fgLum));
+      // Thin regular PDF stems look lighter optically (~#2d3036) than thick bold headings (~#141619)
+      const minLum = pixelIsThinRegular ? 42 : 16;
+      const maxLum = pixelIsThinRegular ? 56 : 34;
+      const clampedLum = Math.max(minLum, Math.min(maxLum, fgLum));
       const delta = clampedLum - fgLum;
       fgR += delta;
       fgG += delta;
@@ -407,12 +406,16 @@ function sampleCanvasStyleForBox(
       autoBgHex: rgbToHex(bgR, bgG, bgB),
       autoFgHex: rgbToHex(fgR, fgG, fgB),
       pixelIsSerif,
+      pixelIsThinRegular,
+      pixelIsThickBold,
     };
   } catch {
     return {
       autoBgHex: "#ffffff",
-      autoFgHex: "#22252a",
+      autoFgHex: "#2e3138",
       pixelIsSerif: false,
+      pixelIsThinRegular: true,
+      pixelIsThickBold: false,
     };
   }
 }
@@ -450,6 +453,83 @@ export function isBlockModified(b: TextBlockItem): boolean {
     Math.abs(b.widthPercent - b.origWidthPercent) > 0.1 ||
     Math.abs(b.heightPercent - b.origHeightPercent) > 0.1
   );
+}
+
+/**
+ * Computes automatic horizontal same-line reflow shifts so that when a word or segment
+ * is lengthened/shortened (via click-to-edit or Find & Replace), all subsequent words
+ * on that same baseline shift horizontally instead of getting overwritten!
+ */
+function computePageReflowMap(
+  pageBlocks: TextBlockItem[],
+  pageWidthPt: number
+): Map<string, { effectiveXPercent: number; needsRedraw: boolean }> {
+  const result = new Map<string, { effectiveXPercent: number; needsRedraw: boolean }>();
+  for (const b of pageBlocks) {
+    result.set(b.id, {
+      effectiveXPercent: b.xPercent,
+      needsRedraw: isBlockModified(b),
+    });
+  }
+
+  if (typeof document === "undefined" || pageWidthPt <= 0) {
+    return result;
+  }
+
+  const mCanvas = document.createElement("canvas");
+  const mCtx = mCanvas.getContext("2d");
+  if (!mCtx) return result;
+
+  // Group single-line non-new blocks by baseline
+  const eligible = pageBlocks.filter(
+    (b) =>
+      !b.isNew &&
+      !b.isWhiteoutOnly &&
+      !b.isMultiline &&
+      Math.abs(b.yPercent - b.origYPercent) <= 0.1 &&
+      Math.abs(b.xPercent - b.origXPercent) <= 0.1
+  );
+
+  const lineGroups: TextBlockItem[][] = [];
+  for (const b of eligible) {
+    const group = lineGroups.find(
+      (g) => Math.abs(g[0].origBaselineYPercent - b.origBaselineYPercent) < 0.42
+    );
+    if (group) {
+      group.push(b);
+    } else {
+      lineGroups.push([b]);
+    }
+  }
+
+  for (const group of lineGroups) {
+    if (group.length <= 1) continue;
+    group.sort((a, b) => a.origXPercent - b.origXPercent);
+
+    let cumShiftPct = 0;
+    for (const b of group) {
+      const modified = isBlockModified(b);
+      const shifted = Math.abs(cumShiftPct) > 0.04;
+      result.set(b.id, {
+        effectiveXPercent: Math.max(0, Math.min(98, b.xPercent + cumShiftPct)),
+        needsRedraw: modified || shifted,
+      });
+
+      if (modified) {
+        const prefix = `${b.isItalic ? "italic " : ""}${b.isBold ? "bold " : ""}`;
+        mCtx.font = `${prefix}100px ${FONT_CSS_MAP[b.fontFamily]}`;
+        const origW100 = mCtx.measureText(b.originalText).width;
+        const currW100 = b.currentText.trim()
+          ? mCtx.measureText(b.currentText).width
+          : 0;
+        const deltaPt = ((currW100 - origW100) / 100) * b.fontSizePt;
+        const deltaPct = (deltaPt / pageWidthPt) * 100;
+        cumShiftPct += deltaPct;
+      }
+    }
+  }
+
+  return result;
 }
 
 function wrapTextIntoLines(
@@ -544,6 +624,20 @@ export default function EditPdfPage() {
     snapshotBeforeDrag: TextBlockItem[];
   } | null>(null);
 
+  // Load genuine Computer Modern Serif / Sans / Typewriter webfonts for 1:1 LaTeX PDF matching
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    const linkId = "cm-webfont-stylesheet";
+    if (!document.getElementById(linkId)) {
+      const link = document.createElement("link");
+      link.id = linkId;
+      link.rel = "stylesheet";
+      link.href =
+        "https://cdn.jsdelivr.net/gh/dreampulse/computer-modern-web-font@master/fonts.css";
+      document.head.appendChild(link);
+    }
+  }, []);
+
   useEffect(() => {
     const el = pdfCanvasRef.current;
     if (!el || typeof ResizeObserver === "undefined") return;
@@ -577,15 +671,20 @@ export default function EditPdfPage() {
     setHistoryFuture((future) => {
       if (future.length === 0) return future;
       const nextState = future[0];
-      setHistoryPast((past) => [...past.slice(-39), textBlocks]);
+      setHistoryPast((past) => [...prevSlice(past), textBlocks]);
       setTextBlocks(nextState);
       return future.slice(1);
     });
+    function prevSlice(arr: TextBlockItem[][]) {
+      return arr.slice(-39);
+    }
   }, [textBlocks]);
 
   /**
-   * Builds blocks at the requested granularity ("word", "line", or "paragraph") from word tokens,
-   * using the true untouched PDF `rawFontSizePt` so font size and weight never mutate!
+   * Builds blocks at the requested granularity ("word", "line", or "paragraph") from word tokens.
+   * Keeps each token's exact locked `rawFontSizePt` without width-stretching distortion, and
+   * only merges words on a line that share the same fontFamily, weight, and style so inline
+   * monospace/italic words ("nums", "target", "n") keep their exact distinct typography!
    */
   const buildBlocksForGranularity = useCallback(
     (
@@ -620,8 +719,10 @@ export default function EditPdfPage() {
           !(isLastListMarker && gapPct > fontPctW * 0.2) &&
           gapPct >= -fontPctW * 0.4 &&
           gapPct < fontPctW * 1.8 &&
-          Math.abs(last.rawFontSizePt - w.rawFontSizePt) <= 2.0 &&
-          last.origIsBold === w.origIsBold
+          Math.abs(last.rawFontSizePt - w.rawFontSizePt) <= 1.2 &&
+          last.origFontFamily === w.origFontFamily &&
+          last.origIsBold === w.origIsBold &&
+          last.origIsItalic === w.origIsItalic
         ) {
           const newRight = Math.max(
             last.origXPercent + last.origWidthPercent,
@@ -629,14 +730,6 @@ export default function EditPdfPage() {
           );
           const newW = newRight - last.origXPercent;
           const combinedText = `${last.originalText} ${w.originalText}`;
-          const calibratedPt = calibrateLineFontSizePt(
-            combinedText,
-            (newW / 100) * pageW,
-            last.rawFontSizePt,
-            last.origFontFamily,
-            last.origIsBold,
-            last.origIsItalic
-          );
 
           last.originalText = combinedText;
           last.currentText = combinedText;
@@ -644,8 +737,6 @@ export default function EditPdfPage() {
           last.widthPercent = newW;
           last.origHeightPercent = Math.max(last.origHeightPercent, w.origHeightPercent);
           last.heightPercent = last.origHeightPercent;
-          last.origFontSizePt = calibratedPt;
-          last.fontSizePt = calibratedPt;
         } else {
           lines.push({ ...w, id: `line_${w.id}` });
         }
@@ -667,8 +758,9 @@ export default function EditPdfPage() {
         const sameFont =
           lastP &&
           lastP.origFontFamily === ln.origFontFamily &&
-          Math.abs(lastP.rawFontSizePt - ln.rawFontSizePt) <= 1.5 &&
-          lastP.origIsBold === ln.origIsBold;
+          Math.abs(lastP.rawFontSizePt - ln.rawFontSizePt) <= 1.2 &&
+          lastP.origIsBold === ln.origIsBold &&
+          lastP.origIsItalic === ln.origIsItalic;
 
         if (
           lastP &&
@@ -727,6 +819,10 @@ export default function EditPdfPage() {
       const rawItems: any[] = textContent.items || [];
       const stylesDict: Record<string, any> = textContent.styles || {};
 
+      const measureCanvas =
+        typeof document !== "undefined" ? document.createElement("canvas") : null;
+      const measureCtx = measureCanvas ? measureCanvas.getContext("2d") : null;
+
       interface WordFrag {
         text: string;
         x: number;
@@ -755,7 +851,7 @@ export default function EditPdfPage() {
 
         const itemW = item.width || item.str.length * (rawFontSize * 0.5);
         const itemH = Math.max(rawFontSize * 1.08, item.height || rawFontSize * 1.08);
-        const yTop = vBaselineY - rawFontSize * 0.8;
+        const yTop = vBaselineY - rawFontSize * 0.82;
 
         const styleObj = stylesDict[item.fontName] || {};
         let fObj: any = null;
@@ -785,7 +881,6 @@ export default function EditPdfPage() {
 
         const rawStr: string = item.str;
         const tokenMatches = Array.from(rawStr.matchAll(/\S+/g));
-        const totalChars = Math.max(1, rawStr.length);
 
         if (tokenMatches.length <= 1) {
           wordFrags.push({
@@ -793,7 +888,7 @@ export default function EditPdfPage() {
             x: vx,
             yTop,
             baselineY: vBaselineY,
-            w: Math.max(itemW, rawFontSize * 0.45),
+            w: Math.max(itemW, rawFontSize * 0.35),
             h: itemH,
             rawFontSize,
             fontFamily,
@@ -801,14 +896,28 @@ export default function EditPdfPage() {
             isItalic,
           });
         } else {
+          // Use proportional glyph measurement instead of naive character count so word X/W are exact
+          let fullMeasuredW = 0;
+          if (measureCtx) {
+            const prefix = `${isItalic ? "italic " : ""}${isBold ? "bold " : ""}`;
+            measureCtx.font = `${prefix}100px ${FONT_CSS_MAP[fontFamily]}`;
+            fullMeasuredW = measureCtx.measureText(rawStr).width;
+          }
+          const totalChars = Math.max(1, rawStr.length);
+
           for (const match of tokenMatches) {
             const wordStr = match[0];
             const startChar = match.index || 0;
-            const wordX = vx + (startChar / totalChars) * itemW;
-            const wordW = Math.max(
-              rawFontSize * 0.4,
-              (wordStr.length / totalChars) * itemW
-            );
+            let wordX = vx + (startChar / totalChars) * itemW;
+            let wordW = Math.max(rawFontSize * 0.35, (wordStr.length / totalChars) * itemW);
+
+            if (measureCtx && fullMeasuredW > 0) {
+              const prefixW = measureCtx.measureText(rawStr.slice(0, startChar)).width;
+              const tokenW = measureCtx.measureText(wordStr).width;
+              wordX = vx + (prefixW / fullMeasuredW) * itemW;
+              wordW = Math.max(rawFontSize * 0.35, (tokenW / fullMeasuredW) * itemW);
+            }
+
             wordFrags.push({
               text: wordStr,
               x: wordX,
@@ -832,6 +941,7 @@ export default function EditPdfPage() {
         return a.x - b.x;
       });
 
+      // Re-join split accents/apostrophes (e.g. "É" + "tant" -> "Étant", "d'" + "entiers" -> "d'entiers")
       const cleanWords: WordFrag[] = [];
       for (const wf of wordFrags) {
         const prev = cleanWords[cleanWords.length - 1];
@@ -840,12 +950,19 @@ export default function EditPdfPage() {
           Math.abs(prev.baselineY - wf.baselineY) <
             Math.min(prev.rawFontSize, wf.rawFontSize) * 0.4;
         const gap = prev ? wf.x - (prev.x + prev.w) : Infinity;
+        const endsWithApostrophe = Boolean(prev && /['’ʼ`-]$/.test(prev.text));
+        const maxJoinGap = endsWithApostrophe
+          ? wf.rawFontSize * 0.26
+          : wf.rawFontSize * 0.13;
+
         if (
           sameBase &&
           prev &&
           gap >= -wf.rawFontSize * 0.35 &&
-          gap <= wf.rawFontSize * 0.13 &&
-          prev.isBold === wf.isBold
+          gap <= maxJoinGap &&
+          prev.fontFamily === wf.fontFamily &&
+          prev.isBold === wf.isBold &&
+          prev.isItalic === wf.isItalic
         ) {
           prev.text += wf.text;
           prev.w = Math.max(prev.w, wf.x + wf.w - prev.x);
@@ -857,8 +974,9 @@ export default function EditPdfPage() {
 
       return cleanWords.map((wd, idx) => {
         let autoBgHex = "#ffffff";
-        let autoFgHex = "#22252a";
+        let autoFgHex = "#2e3138";
         let finalFontFamily: PdfFontFamily = wd.fontFamily;
+        let finalIsBold: boolean = wd.isBold;
 
         if (canvasCtx && canvasW && canvasH) {
           const sampled = sampleCanvasStyleForBox(
@@ -868,20 +986,27 @@ export default function EditPdfPage() {
             wd.x * renderScale,
             wd.yTop * renderScale,
             wd.w * renderScale,
-            wd.h * renderScale
+            wd.h * renderScale,
+            wd.rawFontSize * renderScale
           );
           autoBgHex = sampled.autoBgHex;
           autoFgHex = sampled.autoFgHex;
           if (sampled.pixelIsSerif && finalFontFamily !== "mono") {
             finalFontFamily = "serif";
           }
+          // Guard: if the rendered PDF glyphs have 1px thin stems, force Regular (never Bold!)
+          if (sampled.pixelIsThinRegular) {
+            finalIsBold = false;
+          } else if (sampled.pixelIsThickBold) {
+            finalIsBold = true;
+          }
         }
 
         const xPct = Math.max(0, Math.min(98, (wd.x / pageW) * 100));
         const yPct = Math.max(0, Math.min(98, (wd.yTop / pageH) * 100));
         const baseYPct = Math.max(0, Math.min(99, (wd.baselineY / pageH) * 100));
-        const wPct = Math.max(0.8, Math.min(100 - xPct, ((wd.w + 1) / pageW) * 100));
-        const hPct = Math.max(1.3, ((wd.h + 1.5) / pageH) * 100);
+        const wPct = Math.max(0.6, Math.min(100 - xPct, ((wd.w + 0.6) / pageW) * 100));
+        const hPct = Math.max(1.3, ((wd.h + 1.2) / pageH) * 100);
 
         return {
           id: `p${pageNum}_w_${idx}`,
@@ -902,12 +1027,12 @@ export default function EditPdfPage() {
           origFontSizePt: wd.rawFontSize,
           origFontFamily: finalFontFamily,
           origColor: autoFgHex,
-          origIsBold: wd.isBold,
+          origIsBold: finalIsBold,
           origIsItalic: wd.isItalic,
           fontSizePt: wd.rawFontSize,
           fontFamily: finalFontFamily,
           color: autoFgHex,
-          isBold: wd.isBold,
+          isBold: finalIsBold,
           isItalic: wd.isItalic,
           textAlign: "left",
           maskBg: "auto",
@@ -1015,6 +1140,22 @@ export default function EditPdfPage() {
     }
   };
 
+  const currentPageBlocks = useMemo(
+    () => textBlocks.filter((b) => b.pageNumber === currentPage),
+    [textBlocks, currentPage]
+  );
+
+  const pageReflowMap = useMemo(
+    () => computePageReflowMap(currentPageBlocks, pageBaseSizePt.width),
+    [currentPageBlocks, pageBaseSizePt.width]
+  );
+
+  /**
+   * Two-Pass Canvas Rendering:
+   * Pass 1 paints all background masks (for modified blocks and same-line shifted blocks)
+   * Pass 2 paints all foreground text at its exact shifted `effectiveXPercent` and baseline
+   * so neighboring words NEVER get overwritten or clipped!
+   */
   const repaintVisibleCanvas = useCallback(() => {
     const visibleCanvas = pdfCanvasRef.current;
     const baseCanvas = basePageCanvasRef.current;
@@ -1033,11 +1174,13 @@ export default function EditPdfPage() {
     ctx.clearRect(0, 0, cw, ch);
     ctx.drawImage(baseCanvas, 0, 0);
 
-    const pageBlocks = textBlocks.filter((b) => b.pageNumber === currentPage);
-    for (const block of pageBlocks) {
-      const modified = isBlockModified(block);
+    // PASS 1: Paint paper background masks over original positions and shifted boxes
+    for (const block of currentPageBlocks) {
+      const reflow = pageReflowMap.get(block.id);
+      const needsRedraw = reflow?.needsRedraw || false;
+      const effectiveXPct = reflow?.effectiveXPercent ?? block.xPercent;
       const isSelected = !previewCleanMode && selectedBlockId === block.id;
-      if (!modified && !isSelected) continue;
+      if (!needsRedraw && !isSelected) continue;
 
       const maskHex = resolveMaskHex(block);
 
@@ -1047,10 +1190,10 @@ export default function EditPdfPage() {
         const ow = (block.origWidthPercent / 100) * cw;
         const oh = (block.origHeightPercent / 100) * ch;
         ctx.fillStyle = maskHex;
-        ctx.fillRect(Math.max(0, ox - 1), Math.max(0, oy - 1), ow + 2, oh + 2);
+        ctx.fillRect(Math.max(0, ox - 1), Math.max(0, oy - 0.8), ow + 2, oh + 1.6);
       }
 
-      const bx = (block.xPercent / 100) * cw;
+      const bx = (effectiveXPct / 100) * cw;
       const by = (block.yPercent / 100) * ch;
       const bw = (block.widthPercent / 100) * cw;
       const bh = (block.heightPercent / 100) * ch;
@@ -1061,7 +1204,7 @@ export default function EditPdfPage() {
         continue;
       }
 
-      if (modified && !isSelected && block.currentText.trim()) {
+      if (needsRedraw && !isSelected && block.currentText.trim() && maskHex !== "transparent") {
         const fontPx = Math.max(6.5, block.fontSizePt) * RENDER_SCALE;
         const fontPrefix = `${block.isItalic ? "italic " : ""}${block.isBold ? "bold " : ""}`;
         ctx.font = `${fontPrefix}${fontPx}px ${FONT_CSS_MAP[block.fontFamily]}`;
@@ -1075,44 +1218,73 @@ export default function EditPdfPage() {
         const lineStepPx = (block.lineHeightPt || block.fontSizePt * 1.3) * RENDER_SCALE;
         const maxLineW = Math.max(
           bw,
-          ...wrappedLines.map((l) => ctx.measureText(l).width + 4)
+          ...wrappedLines.map((l) => ctx.measureText(l).width + 2)
         );
         const totalH =
           wrappedLines.length > 1
             ? (wrappedLines.length - 1) * lineStepPx + fontPx * 1.15
             : Math.max(bh, fontPx * 1.08);
 
-        if (maskHex !== "transparent") {
-          ctx.fillStyle = maskHex;
-          ctx.fillRect(Math.max(0, bx - 1), Math.max(0, by - 0.5), maxLineW + 2, totalH + 1);
-        }
-
-        const isRTL = /[\u0600-\u06FF]/.test(block.currentText);
-        ctx.direction = isRTL ? "rtl" : "ltr";
-        ctx.fillStyle = block.color;
-        ctx.textBaseline = "alphabetic";
-
-        const movedVertically = Math.abs(block.yPercent - block.origYPercent) > 0.1;
-        const firstBaselineY = movedVertically
-          ? by + fontPx * 0.8
-          : (block.origBaselineYPercent / 100) * ch;
-
-        wrappedLines.forEach((lineText, idx) => {
-          const lineBaseY = firstBaselineY + idx * lineStepPx;
-          if (isRTL || block.textAlign === "right") {
-            ctx.textAlign = "right";
-            ctx.fillText(lineText, bx + maxLineW - 2, lineBaseY);
-          } else if (block.textAlign === "center") {
-            ctx.textAlign = "center";
-            ctx.fillText(lineText, bx + maxLineW / 2, lineBaseY);
-          } else {
-            ctx.textAlign = "left";
-            ctx.fillText(lineText, bx, lineBaseY);
-          }
-        });
+        ctx.fillStyle = maskHex;
+        ctx.fillRect(Math.max(0, bx - 0.8), Math.max(0, by - 0.5), maxLineW + 1.6, totalH + 1);
       }
     }
-  }, [textBlocks, currentPage, selectedBlockId, previewCleanMode]);
+
+    // PASS 2: Paint foreground replacement/reflowed text cleanly on top of all masks
+    for (const block of currentPageBlocks) {
+      if (block.isWhiteoutOnly) continue;
+      const reflow = pageReflowMap.get(block.id);
+      const needsRedraw = reflow?.needsRedraw || false;
+      const effectiveXPct = reflow?.effectiveXPercent ?? block.xPercent;
+      const isSelected = !previewCleanMode && selectedBlockId === block.id;
+
+      if (!needsRedraw || isSelected || !block.currentText.trim()) continue;
+
+      const bx = (effectiveXPct / 100) * cw;
+      const by = (block.yPercent / 100) * ch;
+      const bw = (block.widthPercent / 100) * cw;
+
+      const fontPx = Math.max(6.5, block.fontSizePt) * RENDER_SCALE;
+      const fontPrefix = `${block.isItalic ? "italic " : ""}${block.isBold ? "bold " : ""}`;
+      ctx.font = `${fontPrefix}${fontPx}px ${FONT_CSS_MAP[block.fontFamily]}`;
+
+      const wrappedLines = wrapTextIntoLines(
+        ctx,
+        block.currentText,
+        bw,
+        block.isMultiline
+      );
+      const lineStepPx = (block.lineHeightPt || block.fontSizePt * 1.3) * RENDER_SCALE;
+      const maxLineW = Math.max(
+        bw,
+        ...wrappedLines.map((l) => ctx.measureText(l).width + 2)
+      );
+
+      const isRTL = /[\u0600-\u06FF]/.test(block.currentText);
+      ctx.direction = isRTL ? "rtl" : "ltr";
+      ctx.fillStyle = block.color;
+      ctx.textBaseline = "alphabetic";
+
+      const movedVertically = Math.abs(block.yPercent - block.origYPercent) > 0.1;
+      const firstBaselineY = movedVertically
+        ? by + fontPx * 0.82
+        : (block.origBaselineYPercent / 100) * ch;
+
+      wrappedLines.forEach((lineText, idx) => {
+        const lineBaseY = firstBaselineY + idx * lineStepPx;
+        if (isRTL || block.textAlign === "right") {
+          ctx.textAlign = "right";
+          ctx.fillText(lineText, bx + maxLineW - 1, lineBaseY);
+        } else if (block.textAlign === "center") {
+          ctx.textAlign = "center";
+          ctx.fillText(lineText, bx + maxLineW / 2, lineBaseY);
+        } else {
+          ctx.textAlign = "left";
+          ctx.fillText(lineText, bx, lineBaseY);
+        }
+      });
+    }
+  }, [currentPageBlocks, pageReflowMap, selectedBlockId, previewCleanMode]);
 
   const renderAndExtractPage = useCallback(
     async (pageNum: number) => {
@@ -1120,6 +1292,10 @@ export default function EditPdfPage() {
 
       setIsRenderingPage(true);
       try {
+        if (typeof document !== "undefined" && (document as any).fonts?.ready) {
+          await (document as any).fonts.ready.catch(() => {});
+        }
+
         const page = await pdfDocProxy.getPage(pageNum);
         const baseViewport = page.getViewport({ scale: 1.0 });
         setPageBaseSizePt({
@@ -1207,9 +1383,6 @@ export default function EditPdfPage() {
     }
   }, []);
 
-  /**
-   * Moves the active cursor to the previous or next line on the page (like Up/Down arrows in Microsoft Word).
-   */
   const handleNavigateLine = useCallback(
     (direction: "up" | "down") => {
       if (!selectedBlockId) return;
@@ -1309,15 +1482,6 @@ export default function EditPdfPage() {
         const boxW = Math.max(2, boxRight - boxLeft);
         const boxH = Math.max(1.4, boxBottom - boxTop);
 
-        const calibratedPt = calibrateLineFontSizePt(
-          lineTexts[0],
-          (boxW / 100) * pageBaseSizePt.width,
-          firstWord.rawFontSizePt,
-          firstWord.origFontFamily,
-          firstWord.origIsBold,
-          firstWord.origIsItalic
-        );
-
         const customId = `custom_sel_${Date.now()}`;
         const customBlock: TextBlockItem = {
           ...firstWord,
@@ -1326,8 +1490,8 @@ export default function EditPdfPage() {
           currentText: combinedText,
           isMultiline: lineTexts.length > 1,
           lineHeightPt: Math.round(firstWord.rawFontSizePt * 1.32 * 10) / 10,
-          origFontSizePt: calibratedPt,
-          fontSizePt: calibratedPt,
+          origFontSizePt: firstWord.rawFontSizePt,
+          fontSizePt: firstWord.rawFontSizePt,
           origXPercent: boxLeft,
           origYPercent: boxTop,
           origBaselineYPercent: firstWord.origBaselineYPercent,
@@ -1351,7 +1515,7 @@ export default function EditPdfPage() {
       window.removeEventListener("pointermove", handleMove);
       window.removeEventListener("pointerup", handleUp);
     };
-  }, [interactionMode, currentPage, wordTokensByPage, pageBaseSizePt.width, handleSelectBlock]);
+  }, [interactionMode, currentPage, wordTokensByPage, handleSelectBlock]);
 
   const handleUpdateBlock = useCallback(
     (id: string, patch: Partial<TextBlockItem>, recordHistory: boolean = true) => {
@@ -1386,12 +1550,12 @@ export default function EditPdfPage() {
       heightPercent: 3.5,
       origFontSizePt: 11,
       origFontFamily: docDefaultFontRef.current,
-      origColor: "#22252a",
+      origColor: "#2e3138",
       origIsBold: false,
       origIsItalic: false,
       fontSizePt: 11,
       fontFamily: docDefaultFontRef.current,
-      color: "#22252a",
+      color: "#2e3138",
       isBold: false,
       isItalic: false,
       textAlign: "left",
@@ -1426,12 +1590,12 @@ export default function EditPdfPage() {
       heightPercent: 4.5,
       origFontSizePt: 11,
       origFontFamily: docDefaultFontRef.current,
-      origColor: "#22252a",
+      origColor: "#2e3138",
       origIsBold: false,
       origIsItalic: false,
       fontSizePt: 11,
       fontFamily: docDefaultFontRef.current,
-      color: "#22252a",
+      color: "#2e3138",
       isBold: false,
       isItalic: false,
       textAlign: "left",
@@ -1652,7 +1816,7 @@ export default function EditPdfPage() {
     );
     const lineStepPx = (block.lineHeightPt || block.fontSizePt * 1.3) * SCALE;
     const measuredW = Math.max(
-      ...wrappedLines.map((l) => mCtx.measureText(l).width + 4 * SCALE)
+      ...wrappedLines.map((l) => mCtx.measureText(l).width + 2 * SCALE)
     );
     const finalW = Math.max(boxWidthPt * SCALE, measuredW);
     const finalH =
@@ -1673,13 +1837,13 @@ export default function EditPdfPage() {
     ctx.fillStyle = block.color;
     ctx.textBaseline = "alphabetic";
 
-    const firstBaselineY = fontPx * 0.8;
+    const firstBaselineY = fontPx * 0.82;
 
     wrappedLines.forEach((lineText, idx) => {
       const baselineY = firstBaselineY + idx * lineStepPx;
       if (isRTL || block.textAlign === "right") {
         ctx.textAlign = "right";
-        ctx.fillText(lineText, canvas.width - 2 * SCALE, baselineY);
+        ctx.fillText(lineText, canvas.width - 1 * SCALE, baselineY);
       } else if (block.textAlign === "center") {
         ctx.textAlign = "center";
         ctx.fillText(lineText, canvas.width / 2, baselineY);
@@ -1719,65 +1883,99 @@ export default function EditPdfPage() {
         setTextBlocks(workingBlocks);
       }
 
-      const blocksToApply = workingBlocks.filter(isBlockModified);
+      const modifiedCount = workingBlocks.filter(isBlockModified).length;
       const arrayBuffer = await file.arrayBuffer();
 
       try {
         const pdfDoc = await PDFDocument.load(arrayBuffer, { ignoreEncryption: true });
         const pages = pdfDoc.getPages();
 
-        for (const block of blocksToApply) {
-          const pageIdx = block.pageNumber - 1;
-          if (pageIdx < 0 || pageIdx >= pages.length) continue;
+        for (let pageIdx = 0; pageIdx < pages.length; pageIdx++) {
+          const pageNum = pageIdx + 1;
           const page = pages[pageIdx];
           const { width: pageW, height: pageH } = page.getSize();
-          const maskHex = resolveMaskHex(block);
+          const pBlocks = workingBlocks.filter((b) => b.pageNumber === pageNum);
+          const reflowMap = computePageReflowMap(pBlocks, pageW);
+          const blocksToDraw = pBlocks.filter((b) => reflowMap.get(b.id)?.needsRedraw);
 
-          if (!block.isNew && maskHex !== "transparent") {
-            const origW = (block.origWidthPercent / 100) * pageW;
-            const origH = (block.origHeightPercent / 100) * pageH;
-            const origX = (block.origXPercent / 100) * pageW;
-            const origY = pageH - (block.origYPercent / 100) * pageH - origH;
-            const { r, g, b } = hexToRgbComponents(maskHex);
+          if (blocksToDraw.length === 0) continue;
 
-            page.drawRectangle({
-              x: Math.max(0, origX - 1),
-              y: Math.max(0, origY - 1),
-              width: origW + 2,
-              height: origH + 2,
-              color: rgb(r, g, b),
-            });
+          // Pre-render replacement PNGs so Pass 1 can paint all paper masks before Pass 2 draws text
+          const renderedMap = new Map<
+            string,
+            { bytes: Uint8Array; widthPt: number; heightPt: number }
+          >();
+
+          for (const block of blocksToDraw) {
+            if (!block.isWhiteoutOnly && block.currentText.trim()) {
+              const curW = (block.widthPercent / 100) * pageW;
+              const curH = (block.heightPercent / 100) * pageH;
+              renderedMap.set(block.id, renderReplacementTextToPng(block, curW, curH));
+            }
           }
 
-          const curW = (block.widthPercent / 100) * pageW;
-          const curH = (block.heightPercent / 100) * pageH;
-          const curX = (block.xPercent / 100) * pageW;
-          const curTopPt = (block.yPercent / 100) * pageH;
+          // PASS 1: Paint all paper background masks first so no mask ever clips adjacent shifted text
+          for (const block of blocksToDraw) {
+            const maskHex = resolveMaskHex(block);
+            const effectiveXPct = reflowMap.get(block.id)?.effectiveXPercent ?? block.xPercent;
 
-          if (block.isWhiteoutOnly) {
-            const fillHex = maskHex === "transparent" ? "#ffffff" : maskHex;
-            const { r, g, b } = hexToRgbComponents(fillHex);
-            page.drawRectangle({
-              x: Math.max(0, curX),
-              y: Math.max(0, pageH - curTopPt - curH),
-              width: curW,
-              height: curH,
-              color: rgb(r, g, b),
-            });
-          } else if (block.currentText.trim()) {
-            const rendered = renderReplacementTextToPng(block, curW, curH);
-            const drawY = pageH - curTopPt - rendered.heightPt;
-
-            if (maskHex !== "transparent") {
+            if (!block.isNew && maskHex !== "transparent") {
+              const origW = (block.origWidthPercent / 100) * pageW;
+              const origH = (block.origHeightPercent / 100) * pageH;
+              const origX = (block.origXPercent / 100) * pageW;
+              const origY = pageH - (block.origYPercent / 100) * pageH - origH;
               const { r, g, b } = hexToRgbComponents(maskHex);
+
               page.drawRectangle({
-                x: Math.max(0, curX - 1),
-                y: Math.max(0, drawY - 0.5),
-                width: rendered.widthPt + 2,
-                height: rendered.heightPt + 1,
+                x: Math.max(0, origX - 1),
+                y: Math.max(0, origY - 0.8),
+                width: origW + 2,
+                height: origH + 1.6,
                 color: rgb(r, g, b),
               });
             }
+
+            const curW = (block.widthPercent / 100) * pageW;
+            const curH = (block.heightPercent / 100) * pageH;
+            const curX = (effectiveXPct / 100) * pageW;
+            const curTopPt = (block.yPercent / 100) * pageH;
+
+            if (block.isWhiteoutOnly) {
+              const fillHex = maskHex === "transparent" ? "#ffffff" : maskHex;
+              const { r, g, b } = hexToRgbComponents(fillHex);
+              page.drawRectangle({
+                x: Math.max(0, curX),
+                y: Math.max(0, pageH - curTopPt - curH),
+                width: curW,
+                height: curH,
+                color: rgb(r, g, b),
+              });
+            } else {
+              const rendered = renderedMap.get(block.id);
+              if (rendered && maskHex !== "transparent") {
+                const drawY = pageH - curTopPt - rendered.heightPt;
+                const { r, g, b } = hexToRgbComponents(maskHex);
+                page.drawRectangle({
+                  x: Math.max(0, curX - 0.8),
+                  y: Math.max(0, drawY - 0.5),
+                  width: rendered.widthPt + 1.6,
+                  height: rendered.heightPt + 1,
+                  color: rgb(r, g, b),
+                });
+              }
+            }
+          }
+
+          // PASS 2: Embed and draw all foreground text PNGs cleanly on top
+          for (const block of blocksToDraw) {
+            if (block.isWhiteoutOnly) continue;
+            const rendered = renderedMap.get(block.id);
+            if (!rendered) continue;
+
+            const effectiveXPct = reflowMap.get(block.id)?.effectiveXPercent ?? block.xPercent;
+            const curX = (effectiveXPct / 100) * pageW;
+            const curTopPt = (block.yPercent / 100) * pageH;
+            const drawY = pageH - curTopPt - rendered.heightPt;
 
             const pngImg = await pdfDoc.embedPng(rendered.bytes);
             page.drawImage(pngImg, {
@@ -1792,7 +1990,7 @@ export default function EditPdfPage() {
         const savedBytes = await pdfDoc.save({ useObjectStreams: true });
         const outName = `edited_${file.name}`;
         downloadBlob(savedBytes, outName);
-        setSuccessMessage(`Saved ${blocksToApply.length} text edit(s) into "${outName}".`);
+        setSuccessMessage(`Saved ${modifiedCount} text edit(s) into "${outName}".`);
       } catch {
         const fallbackDoc = await PDFDocument.create();
         for (let p = 1; p <= totalPages; p++) {
@@ -1805,8 +2003,12 @@ export default function EditPdfPage() {
           const ctx = cnv.getContext("2d")!;
           await pdfPage.render({ canvasContext: ctx, viewport: hiVp }).promise;
 
-          const pBlocks = workingBlocks.filter((b) => b.pageNumber === p && isBlockModified(b));
-          for (const b of pBlocks) {
+          const pBlocks = workingBlocks.filter((b) => b.pageNumber === p);
+          const reflowMap = computePageReflowMap(pBlocks, baseVp.width);
+          const blocksToDraw = pBlocks.filter((b) => reflowMap.get(b.id)?.needsRedraw);
+
+          // Pass 1: Masks
+          for (const b of blocksToDraw) {
             const mHex = resolveMaskHex(b);
             if (!b.isNew && mHex !== "transparent") {
               ctx.fillStyle = mHex;
@@ -1817,7 +2019,12 @@ export default function EditPdfPage() {
                 (b.origHeightPercent / 100) * cnv.height + 2
               );
             }
+          }
+
+          // Pass 2: Text
+          for (const b of blocksToDraw) {
             if (!b.isWhiteoutOnly && b.currentText.trim()) {
+              const effectiveXPct = reflowMap.get(b.id)?.effectiveXPercent ?? b.xPercent;
               const fPx = b.fontSizePt * 2.0;
               ctx.font = `${b.isItalic ? "italic " : ""}${b.isBold ? "bold " : ""}${fPx}px ${
                 FONT_CSS_MAP[b.fontFamily]
@@ -1826,7 +2033,7 @@ export default function EditPdfPage() {
               ctx.textBaseline = "alphabetic";
               const movedV = Math.abs(b.yPercent - b.origYPercent) > 0.1;
               const baseLine = movedV
-                ? (b.yPercent / 100) * cnv.height + fPx * 0.8
+                ? (b.yPercent / 100) * cnv.height + fPx * 0.82
                 : (b.origBaselineYPercent / 100) * cnv.height;
               const wrapped = wrapTextIntoLines(
                 ctx,
@@ -1836,7 +2043,7 @@ export default function EditPdfPage() {
               );
               const stepPx = (b.lineHeightPt || b.fontSizePt * 1.3) * 2.0;
               wrapped.forEach((lnText, idx) => {
-                ctx.fillText(lnText, (b.xPercent / 100) * cnv.width, baseLine + idx * stepPx);
+                ctx.fillText(lnText, (effectiveXPct / 100) * cnv.width, baseLine + idx * stepPx);
               });
             }
           }
@@ -1854,7 +2061,7 @@ export default function EditPdfPage() {
         const fallbackBytes = await fallbackDoc.save();
         const outName = `edited_${file.name}`;
         downloadBlob(fallbackBytes, outName);
-        setSuccessMessage(`Saved ${blocksToApply.length} text edit(s) into "${outName}".`);
+        setSuccessMessage(`Saved ${modifiedCount} text edit(s) into "${outName}".`);
       }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : "Failed to save edited PDF.";
@@ -1864,7 +2071,6 @@ export default function EditPdfPage() {
     }
   };
 
-  const currentPageBlocks = textBlocks.filter((b) => b.pageNumber === currentPage);
   const selectedBlock = textBlocks.find((b) => b.id === selectedBlockId) || null;
   const displayScale =
     pageBaseSizePt.width > 0 ? containerCssWidth / pageBaseSizePt.width : 1.15;
@@ -1877,12 +2083,12 @@ export default function EditPdfPage() {
         {
           question: "How does it preserve the exact original font style and size?",
           answer:
-            "When your PDF loads, our engine reads the embedded PDF font table and locks each line's exact point size, weight (Regular vs Bold), and style (Serif, Calibri, Sans, or Monospace). When you click to edit, your typed text inherits those exact locked settings.",
+            "When your PDF loads, our engine reads the embedded PDF font table and canvas stroke metrics to lock each word's exact point size, weight (Regular vs Bold), and font family (including LaTeX Computer Modern, Calibri, Arial, and Monospace).",
         },
         {
-          question: "Can I edit just a single word, a line, or a full paragraph?",
+          question: "What happens if my new word is longer than the original word?",
           answer:
-            "Yes! Use the 'Word | Line | Paragraph' selector in the top ribbon—or simply drag your mouse across any exact words on the page—to edit as much or as little text as you want.",
+            "Our automatic same-line reflow engine shifts the remaining words on that line to the right so your edited word never overlaps or cuts off the next word.",
         },
         {
           question: "Can I use Up and Down arrow keys like in Microsoft Word?",
@@ -1898,7 +2104,7 @@ export default function EditPdfPage() {
             multiple={false}
             onFilesSelected={handleFileSelected}
             title="Drop a PDF document to edit existing text"
-            description="Click anywhere on your PDF page to edit text directly in-place like a Word document with locked original font size and style."
+            description="Click anywhere on your PDF page to edit text directly in-place like a Word document with locked original font size, style, and automatic line reflow."
           />
         )}
 
@@ -2086,10 +2292,10 @@ export default function EditPdfPage() {
                   aria-label="Font Family"
                   className="rounded border border-slate-200 bg-slate-50 px-2 py-1 text-xs font-medium text-slate-900 disabled:opacity-60 dark:border-slate-700 dark:bg-slate-800 dark:text-white"
                 >
-                  <option value="serif">Times New Roman / Serif</option>
+                  <option value="serif">Computer Modern / Times Serif</option>
                   <option value="calibri">Calibri (Word Body)</option>
                   <option value="sans">Arial / Helvetica</option>
-                  <option value="mono">Courier New (Mono)</option>
+                  <option value="mono">Typewriter / Courier Mono</option>
                 </select>
 
                 {/* Font Size */}
@@ -2100,11 +2306,11 @@ export default function EditPdfPage() {
                     min={6}
                     max={72}
                     disabled={!selectedBlock || Boolean(selectedBlock.isWhiteoutOnly)}
-                    value={selectedBlock ? selectedBlock.fontSizePt : 11}
+                    value={selectedBlock ? selectedBlock.fontSizePt : 10}
                     onChange={(e) =>
                       selectedBlock &&
                       handleUpdateBlock(selectedBlock.id, {
-                        fontSizePt: Math.max(6, Math.min(72, Number(e.target.value) || 11)),
+                        fontSizePt: Math.max(6, Math.min(72, Number(e.target.value) || 10)),
                       })
                     }
                     title="Font Size (pt)"
@@ -2187,7 +2393,7 @@ export default function EditPdfPage() {
                   <input
                     type="color"
                     disabled={!selectedBlock || Boolean(selectedBlock.isWhiteoutOnly)}
-                    value={selectedBlock ? selectedBlock.color : "#22252a"}
+                    value={selectedBlock ? selectedBlock.color : "#2e3138"}
                     onChange={(e) =>
                       selectedBlock &&
                       handleUpdateBlock(selectedBlock.id, { color: e.target.value })
@@ -2430,6 +2636,8 @@ export default function EditPdfPage() {
                 {currentPageBlocks.map((block) => {
                   const isSelected = !previewCleanMode && selectedBlockId === block.id;
                   const isModified = isBlockModified(block);
+                  const reflow = pageReflowMap.get(block.id);
+                  const effectiveXPct = reflow?.effectiveXPercent ?? block.xPercent;
                   const isFindHit =
                     findQuery.trim().length > 0 &&
                     !block.isWhiteoutOnly &&
@@ -2462,7 +2670,7 @@ export default function EditPdfPage() {
                         }
                       }}
                       style={{
-                        left: `${block.xPercent}%`,
+                        left: `${effectiveXPct}%`,
                         top: `${block.yPercent}%`,
                         minWidth: `${block.widthPercent}%`,
                         minHeight: `${block.heightPercent}%`,
@@ -2482,7 +2690,7 @@ export default function EditPdfPage() {
                         isSelected
                           ? "z-30 ring-1 ring-blue-500/60"
                           : isFindHit
-                            ? "z-25 bg-amber-300/35 ring-1 ring-amber-500"
+                            ? "z-25 bg-amber-300/25 ring-1 ring-amber-500/70"
                             : "z-10 hover:bg-blue-500/[0.06] cursor-text"
                       }`}
                     >
