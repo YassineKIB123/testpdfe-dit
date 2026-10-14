@@ -70,9 +70,10 @@ export interface TextBlockItem {
 }
 
 const FONT_CSS_MAP: Record<PdfFontFamily, string> = {
+  serif:
+    '"Computer Modern Serif", "Latin Modern Roman", "Times New Roman", Times, Georgia, Cambria, serif',
   calibri: 'Calibri, Carlito, "Segoe UI", Candara, Arial, sans-serif',
   sans: 'Arial, Helvetica, "Liberation Sans", system-ui, sans-serif',
-  serif: '"Times New Roman", Times, Georgia, Cambria, serif',
   mono: '"Courier New", Courier, Consolas, Menlo, monospace',
 };
 
@@ -123,6 +124,106 @@ function dataUrlToUint8Array(dataUrl: string): Uint8Array {
 }
 
 /**
+ * Scans the raw PDF file bytes for `/BaseFont /...` entries to determine the document's
+ * primary embedded font family (e.g., LaTeX CMR/SFRM/LMRoman -> "serif", Word Calibri -> "calibri").
+ */
+function detectDocumentDefaultFontFromBytes(buffer: ArrayBuffer): PdfFontFamily {
+  try {
+    const slice = buffer.slice(0, Math.min(buffer.byteLength, 2 * 1024 * 1024));
+    const ascii = new TextDecoder("latin1").decode(slice);
+    const matches = ascii.match(/\/BaseFont\s*\/([^\s\/\[\]<>()]+)/g) || [];
+    let serifScore = 0;
+    let calibriScore = 0;
+    let sansScore = 0;
+
+    for (const raw of matches) {
+      const name = raw.toLowerCase();
+      if (
+        /cmr|cmbx|cmti|cmsl|cmcsc|cmmi|sfrm|sfbx|sfti|sfsl|lmroman|times|georgia|garamond|cambria|palatino|baskerville|nimbusrom|termes|pagella|bonum|schola|libertine|libertinus|charter|bookman|century|utopia|fourier|stix|xits|serif/.test(
+          name
+        ) &&
+        !/sans|cmss|sfss|lmsans/.test(name)
+      ) {
+        serifScore += 2;
+      } else if (/calibri|carlito|aptos|candara|corbel|segoe/.test(name)) {
+        calibriScore += 2;
+      } else if (/arial|helvetica|inter|roboto|tahoma|verdana|cmss|sfss|lmsans|sans/.test(name)) {
+        sansScore += 1;
+      }
+    }
+
+    if (serifScore > 0 && serifScore >= calibriScore && serifScore >= sansScore) {
+      return "serif";
+    }
+    if (calibriScore > 0 && calibriScore >= sansScore) {
+      return "calibri";
+    }
+    if (sansScore > 0) {
+      return "sans";
+    }
+    return "serif";
+  } catch {
+    return "serif";
+  }
+}
+
+/**
+ * Classifies a font name string into PdfFontFamily, bold, and italic flags,
+ * supporting LaTeX (CMR, SFRM, LMRoman, CMBX, SFBX, CMTI, SFTI), Word (Calibri), and standard PDF fonts.
+ */
+function classifyPdfFontMetadata(
+  realFontName: string,
+  fallbackStyleFamily: string,
+  transformShear: number,
+  fontSize: number,
+  docDefaultFamily: PdfFontFamily,
+  fObj?: any
+): { fontFamily: PdfFontFamily; isBold: boolean; isItalic: boolean } {
+  const lowerName = realFontName.toLowerCase();
+  const lowerStyle = fallbackStyleFamily.toLowerCase();
+
+  let fontFamily: PdfFontFamily = docDefaultFamily;
+
+  if (
+    Boolean(fObj?.isMonospace) ||
+    /mono|courier|consolas|menlo|fixed|typewriter|code|cmtt|sftt|lmmono/.test(lowerName) ||
+    lowerStyle === "monospace"
+  ) {
+    fontFamily = "mono";
+  } else if (
+    Boolean(fObj?.isSerifFont) ||
+    (/serif|times|georgia|garamond|cambria|palatino|mincho|baskerville|cmr|cmbx|cmti|cmsl|cmcsc|cmmi|sfrm|sfbx|sfti|sfsl|sfcsc|lmroman|nimbusrom|termes|pagella|bonum|schola|libertine|libertinus|charter|bookman|century|utopia|fourier|stix|xits|crimson|merriweather|bodoni|caslon|didot|constantia/.test(
+      lowerName
+    ) &&
+      !/sans|cmss|sfss|lmsans/.test(lowerName)) ||
+    lowerStyle === "serif"
+  ) {
+    fontFamily = "serif";
+  } else if (/calibri|carlito|aptos|candara|corbel|segoe/.test(lowerName)) {
+    fontFamily = "calibri";
+  } else if (
+    /arial|helvetica|inter|roboto|tahoma|verdana|cmss|sfss|lmsans|dejavusans|liberationsans/.test(
+      lowerName
+    )
+  ) {
+    fontFamily = "sans";
+  }
+
+  const isBold =
+    Boolean(fObj?.bold || fObj?.black) ||
+    /bold|black|heavy|demi|semibold|extrabold|-bd|cmbx|sfbx|lmroman.*bold|nimbusrom.*medi|-medi|700|800|900/.test(
+      lowerName
+    );
+
+  const isItalic =
+    Boolean(fObj?.italic) ||
+    /italic|oblique|slanted|-it|cmti|sfti|cmsl|sfsl|cmmi|lmroman.*italic/.test(lowerName) ||
+    Math.abs(transformShear) > 0.08 * fontSize;
+
+  return { fontFamily, isBold, isItalic };
+}
+
+/**
  * Calibrates the exact decimal fontSizePt so that the browser's canvas font matches
  * the exact horizontal width (`targetWidthPt`) and visual x-height of the PDF line.
  */
@@ -164,7 +265,14 @@ function calibrateFontSizePt(
   }
 }
 
-function sampleCanvasColorsForBox(
+/**
+ * Samples the rendered PDF canvas for a text bounding box to detect:
+ * 1. Background paper/cell color (`autoBgHex`) from perimeter pixels
+ * 2. Optical stroke ink color (`autoFgHex`) from the 22nd–54th contrast percentile of glyph pixels
+ *    (compensating for browser DirectWrite stem darkening so thin LaTeX/PDF fonts never look too dark!)
+ * 3. Pixel-level Serif foot ratio (`pixelIsSerif`) by comparing baseline serif-foot row density vs mid-stem rows
+ */
+function sampleCanvasStyleForBox(
   ctx: CanvasRenderingContext2D,
   canvasW: number,
   canvasH: number,
@@ -172,16 +280,21 @@ function sampleCanvasColorsForBox(
   boxYPx: number,
   boxWPx: number,
   boxHPx: number
-): { autoBgHex: string; autoFgHex: string } {
+): { autoBgHex: string; autoFgHex: string; pixelIsSerif: boolean; pixelIsBold: boolean } {
   try {
-    const pad = 3;
+    const pad = 2;
     const sx = Math.max(0, Math.floor(boxXPx - pad));
     const sy = Math.max(0, Math.floor(boxYPx - pad));
     const sw = Math.min(canvasW - sx, Math.ceil(boxWPx + pad * 2));
     const sh = Math.min(canvasH - sy, Math.ceil(boxHPx + pad * 2));
 
-    if (sw <= 2 || sh <= 2) {
-      return { autoBgHex: "#ffffff", autoFgHex: "#1f242d" };
+    if (sw <= 3 || sh <= 3) {
+      return {
+        autoBgHex: "#ffffff",
+        autoFgHex: "#36383e",
+        pixelIsSerif: false,
+        pixelIsBold: false,
+      };
     }
 
     const imgData = ctx.getImageData(sx, sy, sw, sh).data;
@@ -190,13 +303,11 @@ function sampleCanvasColorsForBox(
     const edgeB: number[] = [];
 
     for (let x = 0; x < sw; x += 2) {
-      for (const y of [0, 1, sh - 2, sh - 1]) {
-        if (y >= 0 && y < sh) {
-          const idx = (y * sw + x) * 4;
-          edgeR.push(imgData[idx]);
-          edgeG.push(imgData[idx + 1]);
-          edgeB.push(imgData[idx + 2]);
-        }
+      for (const y of [0, sh - 1]) {
+        const idx = (y * sw + x) * 4;
+        edgeR.push(imgData[idx]);
+        edgeG.push(imgData[idx + 1]);
+        edgeB.push(imgData[idx + 2]);
       }
     }
 
@@ -213,39 +324,103 @@ function sampleCanvasColorsForBox(
       bgB = edgeB[mid];
     }
 
-    let bestFgR = 31,
-      bestFgG = 36,
-      bestFgB = 45,
-      maxDist = 0;
+    const inkPixels: { r: number; g: number; b: number; dist: number }[] = [];
+    const rowInkCounts: number[] = new Array(sh).fill(0);
+    let veryDarkCount = 0;
 
-    for (let y = 2; y < sh - 2; y += 2) {
-      for (let x = 2; x < sw - 2; x += 2) {
+    for (let y = 1; y < sh - 1; y++) {
+      for (let x = 1; x < sw - 1; x++) {
         const idx = (y * sw + x) * 4;
         const r = imgData[idx];
         const g = imgData[idx + 1];
         const b = imgData[idx + 2];
         const dist = Math.abs(r - bgR) + Math.abs(g - bgG) + Math.abs(b - bgB);
-        if (dist > maxDist && dist > 85) {
-          maxDist = dist;
-          bestFgR = r;
-          bestFgG = g;
-          bestFgB = b;
+        if (dist > 70) {
+          inkPixels.push({ r, g, b, dist });
+          rowInkCounts[y]++;
+          if (dist > 480) {
+            veryDarkCount++;
+          }
         }
       }
     }
 
-    if (bestFgR < 35 && bestFgG < 35 && bestFgB < 35) {
-      bestFgR = 31;
-      bestFgG = 36;
-      bestFgB = 45;
+    if (inkPixels.length === 0) {
+      return {
+        autoBgHex: rgbToHex(bgR, bgG, bgB),
+        autoFgHex: "#36383e",
+        pixelIsSerif: false,
+        pixelIsBold: false,
+      };
     }
+
+    inkPixels.sort((a, b) => b.dist - a.dist);
+
+    const coreRatio = veryDarkCount / Math.max(1, inkPixels.length);
+    const topPixel = inkPixels[0];
+    const colorSat =
+      Math.max(topPixel.r, topPixel.g, topPixel.b) -
+      Math.min(topPixel.r, topPixel.g, topPixel.b);
+
+    const startRatio = colorSat > 35 ? 0.08 : 0.22;
+    const endRatio = colorSat > 35 ? 0.35 : 0.54;
+    const startIdx = Math.floor(inkPixels.length * startRatio);
+    const endIdx = Math.max(startIdx + 1, Math.floor(inkPixels.length * endRatio));
+
+    let sumR = 0,
+      sumG = 0,
+      sumB = 0;
+    for (let i = startIdx; i < endIdx; i++) {
+      sumR += inkPixels[i].r;
+      sumG += inkPixels[i].g;
+      sumB += inkPixels[i].b;
+    }
+    const count = Math.max(1, endIdx - startIdx);
+    let fgR = sumR / count;
+    let fgG = sumG / count;
+    let fgB = sumB / count;
+
+    const bgLum = (bgR + bgG + bgB) / 3;
+    const fgLum = (fgR + fgG + fgB) / 3;
+    if (bgLum > 200 && colorSat <= 30) {
+      const targetMinLum = coreRatio >= 0.62 ? 16 : 52;
+      const targetMaxLum = coreRatio >= 0.62 ? 36 : 68;
+      const clampedLum = Math.max(targetMinLum, Math.min(targetMaxLum, fgLum));
+      const delta = clampedLum - fgLum;
+      fgR += delta;
+      fgG += delta;
+      fgB += delta;
+    }
+
+    const activeRows = rowInkCounts.filter((c) => c > Math.max(4, sw * 0.03));
+    let pixelIsSerif = false;
+    if (activeRows.length >= 5) {
+      const midStart = Math.floor(activeRows.length * 0.3);
+      const midEnd = Math.max(midStart + 1, activeRows.length - 2);
+      const midSlice = activeRows.slice(midStart, midEnd);
+      const midAvg =
+        midSlice.reduce((acc, v) => acc + v, 0) / Math.max(1, midSlice.length);
+      const basePeak = Math.max(...activeRows.slice(-3));
+      if (basePeak / Math.max(1, midAvg) >= 1.48) {
+        pixelIsSerif = true;
+      }
+    }
+
+    const pixelIsBold = coreRatio >= 0.64 && fgLum < 32;
 
     return {
       autoBgHex: rgbToHex(bgR, bgG, bgB),
-      autoFgHex: rgbToHex(bestFgR, bestFgG, bestFgB),
+      autoFgHex: rgbToHex(fgR, fgG, fgB),
+      pixelIsSerif,
+      pixelIsBold,
     };
   } catch {
-    return { autoBgHex: "#ffffff", autoFgHex: "#1f242d" };
+    return {
+      autoBgHex: "#ffffff",
+      autoFgHex: "#36383e",
+      pixelIsSerif: false,
+      pixelIsBold: false,
+    };
   }
 }
 
@@ -312,6 +487,7 @@ export default function EditPdfPage() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
 
+  const docDefaultFontRef = useRef<PdfFontFamily>("serif");
   const extractedPagesRef = useRef<Set<number>>(new Set());
   const colorSampledPagesRef = useRef<Set<number>>(new Set());
 
@@ -420,37 +596,30 @@ export default function EditPdfPage() {
         const yTop = vBaselineY - fontSize * 0.8;
 
         const styleObj = stylesDict[item.fontName] || {};
-        let rawFontMeta = `${item.fontName || ""} ${styleObj.fontFamily || ""}`;
+        let fObj: any = null;
+        let realFontName = `${item.fontName || ""}`;
         try {
+          const commonObjs = page.commonObjs || page._transport?.commonObjs;
           if (
-            page.commonObjs &&
-            typeof page.commonObjs.has === "function" &&
-            page.commonObjs.has(item.fontName)
+            commonObjs &&
+            typeof commonObjs.has === "function" &&
+            commonObjs.has(item.fontName)
           ) {
-            const fObj = page.commonObjs.get(item.fontName);
-            if (fObj?.name) rawFontMeta += ` ${fObj.name}`;
+            fObj = commonObjs.get(item.fontName);
+            if (fObj?.name) realFontName += ` ${fObj.name}`;
           }
         } catch {
           // Ignore if commonObjs is not populated
         }
 
-        const lowerFont = rawFontMeta.toLowerCase();
-        let fontFamily: PdfFontFamily = "calibri";
-        if (/mono|courier|consolas|menlo|fixed|typewriter|code/.test(lowerFont)) {
-          fontFamily = "mono";
-        } else if (
-          /serif|times|georgia|garamond|cambria|palatino|mincho|baskerville/.test(lowerFont) &&
-          !/sans/.test(lowerFont)
-        ) {
-          fontFamily = "serif";
-        } else if (/arial|helvetica|inter|roboto|tahoma|verdana/.test(lowerFont)) {
-          fontFamily = "sans";
-        }
-
-        const isBold = /bold|black|heavy|demi|semibold|extrabold|-bd|700|800|900/.test(lowerFont);
-        const isItalic =
-          /italic|oblique|slanted|-it/.test(lowerFont) ||
-          Math.abs(item.transform[2]) > 0.08 * fontSize;
+        const { fontFamily, isBold, isItalic } = classifyPdfFontMetadata(
+          realFontName,
+          styleObj.fontFamily || "",
+          item.transform[2],
+          fontSize,
+          docDefaultFontRef.current,
+          fObj
+        );
 
         const leadingListMatch = item.str.match(
           /^(\s*(?:\d+[\.\)]|[a-zA-Z][\.\)]|[•●▪◦\-–—\*]))(\s{2,}|\t+)(.+)$/
@@ -544,6 +713,7 @@ export default function EditPdfPage() {
           last.text += spacer + frag.text;
           last.w = Math.max(last.w, frag.x + frag.w - last.x);
           last.h = Math.max(last.h, frag.h);
+          if (frag.fontFamily === "serif") last.fontFamily = "serif";
         } else {
           mergedLines.push({ ...frag });
         }
@@ -551,10 +721,12 @@ export default function EditPdfPage() {
 
       return mergedLines.map((ln, idx) => {
         let autoBgHex = "#ffffff";
-        let autoFgHex = "#1f242d";
+        let autoFgHex = "#36383e";
+        let finalFontFamily: PdfFontFamily = ln.fontFamily;
+        let finalIsBold = ln.isBold;
 
         if (canvasCtx && canvasW && canvasH) {
-          const sampled = sampleCanvasColorsForBox(
+          const sampled = sampleCanvasStyleForBox(
             canvasCtx,
             canvasW,
             canvasH,
@@ -565,14 +737,20 @@ export default function EditPdfPage() {
           );
           autoBgHex = sampled.autoBgHex;
           autoFgHex = sampled.autoFgHex;
+          if (sampled.pixelIsSerif && finalFontFamily !== "mono") {
+            finalFontFamily = "serif";
+          }
+          if (sampled.pixelIsBold) {
+            finalIsBold = true;
+          }
         }
 
         const calibratedPt = calibrateFontSizePt(
           ln.text,
           ln.w,
           ln.fontSize,
-          ln.fontFamily,
-          ln.isBold,
+          finalFontFamily,
+          finalIsBold,
           ln.isItalic
         );
 
@@ -598,9 +776,9 @@ export default function EditPdfPage() {
           widthPercent: wPct,
           heightPercent: hPct,
           fontSizePt: calibratedPt,
-          fontFamily: ln.fontFamily,
+          fontFamily: finalFontFamily,
           color: autoFgHex,
-          isBold: ln.isBold,
+          isBold: finalIsBold,
           isItalic: ln.isItalic,
           textAlign: "left",
           maskBg: "auto",
@@ -630,6 +808,8 @@ export default function EditPdfPage() {
     try {
       const pdfjs = await loadPdfJs();
       const buffer = await selected.arrayBuffer();
+      docDefaultFontRef.current = detectDocumentDefaultFontFromBytes(buffer);
+
       const pdf = await pdfjs.getDocument({ data: buffer }).promise;
       setPdfDocProxy(pdf);
       setTotalPages(pdf.numPages);
@@ -804,7 +984,7 @@ export default function EditPdfPage() {
           setTextBlocks((old) =>
             old.map((b) => {
               if (b.pageNumber !== pageNum || b.isNew) return b;
-              const sampled = sampleCanvasColorsForBox(
+              const sampled = sampleCanvasStyleForBox(
                 offCtx,
                 offscreen.width,
                 offscreen.height,
@@ -813,12 +993,25 @@ export default function EditPdfPage() {
                 (b.origWidthPercent / 100) * offscreen.width,
                 (b.origHeightPercent / 100) * offscreen.height
               );
-              const isUnmodifiedColor = b.color === "#1f242d" || b.color === "#0f172a";
+              const nextFamily =
+                sampled.pixelIsSerif && b.fontFamily !== "mono" ? "serif" : b.fontFamily;
+              const nextBold = b.isBold || sampled.pixelIsBold;
+              const nextPt = calibrateFontSizePt(
+                b.originalText,
+                (b.origWidthPercent / 100) * baseViewport.width,
+                b.fontSizePt,
+                nextFamily,
+                nextBold,
+                b.isItalic
+              );
               return {
                 ...b,
+                fontFamily: nextFamily,
+                isBold: nextBold,
+                fontSizePt: nextPt,
                 autoBgHex: sampled.autoBgHex,
                 customMaskHex: sampled.autoBgHex,
-                color: isUnmodifiedColor ? sampled.autoFgHex : b.color,
+                color: sampled.autoFgHex,
               };
             })
           );
@@ -918,8 +1111,8 @@ export default function EditPdfPage() {
       widthPercent: 28,
       heightPercent: 3.5,
       fontSizePt: 11,
-      fontFamily: "calibri",
-      color: "#1f242d",
+      fontFamily: docDefaultFontRef.current,
+      color: "#36383e",
       isBold: false,
       isItalic: false,
       textAlign: "left",
@@ -952,8 +1145,8 @@ export default function EditPdfPage() {
       widthPercent: 28,
       heightPercent: 4.5,
       fontSizePt: 11,
-      fontFamily: "calibri",
-      color: "#1f242d",
+      fontFamily: docDefaultFontRef.current,
+      color: "#36383e",
       isBold: false,
       isItalic: false,
       textAlign: "left",
@@ -1382,12 +1575,12 @@ export default function EditPdfPage() {
   return (
     <ToolLayout
       title="Edit PDF Text Online"
-      description="Click any existing text in your PDF to edit or replace it in-place with automatic font and background color matching. Includes Find & Replace, Undo/Redo, freeform text, and redaction—100% private in your browser."
+      description="Click any existing text in your PDF to edit or replace it in-place with automatic font, size, and optical ink-color matching. Includes Find & Replace, Undo/Redo, freeform text, and redaction—100% private in your browser."
       faqs={[
         {
-          question: "How do I edit existing text in my PDF?",
+          question: "How does automatic font and ink darkness matching work?",
           answer:
-            "Simply click any line of text on the PDF page (or use the Find & Replace bar at the top). The Selected Line Replace bar will fill with that exact line so you can type your new text, see the original text replaced live on the PDF page with matched font and size, and click 'Save PDF'.",
+            "Our engine inspects both the embedded PDF font table (supporting LaTeX Computer Modern, Times/Serif, Calibri, Arial, and Courier) and the rendered glyph pixels on the page to match exact font family, decimal point size, baseline, and optical stroke shade.",
         },
         {
           question: "Can I Find and Replace words across the entire PDF?",
@@ -1408,7 +1601,7 @@ export default function EditPdfPage() {
             multiple={false}
             onFilesSelected={handleFileSelected}
             title="Drop a PDF document to edit existing text"
-            description="Click any title, sentence, date, or number inside your PDF to replace it in-place with auto-matched fonts and background colors."
+            description="Click any title, sentence, date, or number inside your PDF to replace it in-place with auto-matched fonts and optical ink colors."
           />
         )}
 
@@ -1704,9 +1897,9 @@ export default function EditPdfPage() {
                           aria-label="Font Family"
                           className="rounded border border-slate-200 bg-white px-2 py-1 text-xs font-medium text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-white"
                         >
-                          <option value="calibri">Calibri / Word Default</option>
+                          <option value="serif">Serif (LaTeX / Times / Georgia)</option>
+                          <option value="calibri">Calibri (Word Default)</option>
                           <option value="sans">Arial / Helvetica (Sans)</option>
-                          <option value="serif">Times / Georgia (Serif)</option>
                           <option value="mono">Courier (Monospace)</option>
                         </select>
 
@@ -1794,7 +1987,8 @@ export default function EditPdfPage() {
                         <div className="flex items-center gap-1.5">
                           <span className="text-slate-500">Ink:</span>
                           {[
-                            { hex: "#1f242d", label: "PDF Charcoal / Black" },
+                            { hex: "#383a40", label: "Soft PDF Ink (LaTeX / Thin)" },
+                            { hex: "#1f242d", label: "Deep Charcoal / Bold" },
                             { hex: "#1d4ed8", label: "Royal Blue" },
                             { hex: "#dc2626", label: "Crimson Red" },
                             { hex: "#059669", label: "Emerald Green" },
@@ -1820,7 +2014,7 @@ export default function EditPdfPage() {
                             onChange={(e) =>
                               handleUpdateBlock(selectedBlock.id, { color: e.target.value })
                             }
-                            title="Custom Text Color"
+                            title="Custom Text Color (Auto-Sampled from PDF)"
                             className="h-5 w-6 cursor-pointer rounded border border-slate-300 bg-white p-0"
                           />
                         </div>
@@ -1972,7 +2166,7 @@ export default function EditPdfPage() {
                   width: `${Math.round(pageBaseSizePt.width * 1.35 * (zoomPercent / 100))}px`,
                   maxWidth: zoomPercent > 100 ? "none" : "100%",
                 }}
-                className="relative mx-auto block h-fit select-none shadow-xl border border-slate-200/80 bg-white leading-none"
+                className="relative mx-auto block h-fit select-none shadow-xl border border-slate-200/80 bg-white leading-none antialiased"
               >
                 <canvas ref={pdfCanvasRef} className="block w-full h-auto rounded-xs" />
 
@@ -2057,7 +2251,6 @@ export default function EditPdfPage() {
                           {isSelected ? "Drag or Resize Mask" : ""}
                         </div>
                       ) : isSelected ? (
-                        /* Auto-expanding inline-grid so 100% of the text is always visible without horizontal scrolling */
                         <div className="inline-grid w-full items-center">
                           <span
                             aria-hidden="true"
@@ -2097,11 +2290,10 @@ export default function EditPdfPage() {
                               fontSize: `${scaledFontPx}px`,
                               textAlign: block.textAlign,
                             }}
-                            className="col-start-1 row-start-1 w-full min-w-full bg-transparent outline-none leading-none px-0.5"
+                            className="col-start-1 row-start-1 w-full min-w-full bg-transparent outline-none leading-none px-0.5 antialiased"
                           />
                         </div>
                       ) : isModified ? (
-                        /* Invisible sizer keeps the green dashed box wrapping 100% of edited text width */
                         <span
                           aria-hidden="true"
                           style={{
