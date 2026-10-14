@@ -38,7 +38,7 @@ import {
   Check,
 } from "lucide-react";
 
-export type PdfFontFamily = "sans" | "serif" | "mono";
+export type PdfFontFamily = "calibri" | "sans" | "serif" | "mono";
 export type MaskBgMode = "auto" | "white" | "cream" | "black" | "transparent" | "custom";
 export type TextAlignMode = "left" | "center" | "right";
 
@@ -51,6 +51,7 @@ export interface TextBlockItem {
   isWhiteoutOnly?: boolean;
   origXPercent: number;
   origYPercent: number;
+  origBaselineYPercent: number;
   origWidthPercent: number;
   origHeightPercent: number;
   xPercent: number;
@@ -69,7 +70,8 @@ export interface TextBlockItem {
 }
 
 const FONT_CSS_MAP: Record<PdfFontFamily, string> = {
-  sans: "Inter, Helvetica, Arial, system-ui, -apple-system, sans-serif",
+  calibri: 'Calibri, Carlito, "Segoe UI", Candara, Arial, sans-serif',
+  sans: 'Arial, Helvetica, "Liberation Sans", system-ui, sans-serif',
   serif: '"Times New Roman", Times, Georgia, Cambria, serif',
   mono: '"Courier New", Courier, Consolas, Menlo, monospace',
 };
@@ -120,6 +122,48 @@ function dataUrlToUint8Array(dataUrl: string): Uint8Array {
   return bytes;
 }
 
+/**
+ * Calibrates the exact decimal fontSizePt so that the browser's canvas font matches
+ * the exact horizontal width (`targetWidthPt`) and visual x-height of the PDF line.
+ */
+function calibrateFontSizePt(
+  text: string,
+  targetWidthPt: number,
+  rawFontSizePt: number,
+  fontFamily: PdfFontFamily,
+  isBold: boolean,
+  isItalic: boolean
+): number {
+  const fallback = Math.round(rawFontSizePt * 10) / 10;
+  if (
+    !text ||
+    text.trim().length < 3 ||
+    targetWidthPt <= 8 ||
+    typeof document === "undefined"
+  ) {
+    return fallback;
+  }
+  try {
+    const c = document.createElement("canvas");
+    const ctx = c.getContext("2d");
+    if (!ctx) return fallback;
+    const testPx = 100;
+    const prefix = `${isItalic ? "italic " : ""}${isBold ? "bold " : ""}`;
+    ctx.font = `${prefix}${testPx}px ${FONT_CSS_MAP[fontFamily]}`;
+    const measuredAt100 = ctx.measureText(text).width;
+    if (measuredAt100 <= 0) return fallback;
+
+    const widthMatchedPt = (targetWidthPt / measuredAt100) * testPx;
+    const clamped = Math.max(
+      rawFontSizePt * 0.76,
+      Math.min(rawFontSizePt * 1.04, widthMatchedPt)
+    );
+    return Math.round(clamped * 10) / 10;
+  } catch {
+    return fallback;
+  }
+}
+
 function sampleCanvasColorsForBox(
   ctx: CanvasRenderingContext2D,
   canvasW: number,
@@ -137,7 +181,7 @@ function sampleCanvasColorsForBox(
     const sh = Math.min(canvasH - sy, Math.ceil(boxHPx + pad * 2));
 
     if (sw <= 2 || sh <= 2) {
-      return { autoBgHex: "#ffffff", autoFgHex: "#0f172a" };
+      return { autoBgHex: "#ffffff", autoFgHex: "#1f242d" };
     }
 
     const imgData = ctx.getImageData(sx, sy, sw, sh).data;
@@ -169,9 +213,9 @@ function sampleCanvasColorsForBox(
       bgB = edgeB[mid];
     }
 
-    let bestFgR = 15,
-      bestFgG = 23,
-      bestFgB = 42,
+    let bestFgR = 31,
+      bestFgG = 36,
+      bestFgB = 45,
       maxDist = 0;
 
     for (let y = 2; y < sh - 2; y += 2) {
@@ -190,12 +234,18 @@ function sampleCanvasColorsForBox(
       }
     }
 
+    if (bestFgR < 35 && bestFgG < 35 && bestFgB < 35) {
+      bestFgR = 31;
+      bestFgG = 36;
+      bestFgB = 45;
+    }
+
     return {
       autoBgHex: rgbToHex(bgR, bgG, bgB),
       autoFgHex: rgbToHex(bestFgR, bestFgG, bestFgB),
     };
   } catch {
-    return { autoBgHex: "#ffffff", autoFgHex: "#0f172a" };
+    return { autoBgHex: "#ffffff", autoFgHex: "#1f242d" };
   }
 }
 
@@ -343,6 +393,7 @@ export default function EditPdfPage() {
         text: string;
         x: number;
         yTop: number;
+        baselineY: number;
         w: number;
         h: number;
         fontSize: number;
@@ -360,13 +411,13 @@ export default function EditPdfPage() {
         const vx = m[4];
         const vBaselineY = m[5];
         const fontSize = Math.max(
-          7,
+          6.5,
           Math.round((Math.hypot(m[2], m[3]) || Math.hypot(m[0], m[1])) * 10) / 10
         );
 
-        const itemW = item.width || item.str.length * (fontSize * 0.52);
-        const itemH = Math.max(fontSize * 1.12, item.height || fontSize * 1.12);
-        const yTop = vBaselineY - fontSize * 0.82;
+        const itemW = item.width || item.str.length * (fontSize * 0.5);
+        const itemH = Math.max(fontSize * 1.08, item.height || fontSize * 1.08);
+        const yTop = vBaselineY - fontSize * 0.8;
 
         const styleObj = stylesDict[item.fontName] || {};
         let rawFontMeta = `${item.fontName || ""} ${styleObj.fontFamily || ""}`;
@@ -384,7 +435,7 @@ export default function EditPdfPage() {
         }
 
         const lowerFont = rawFontMeta.toLowerCase();
-        let fontFamily: PdfFontFamily = "sans";
+        let fontFamily: PdfFontFamily = "calibri";
         if (/mono|courier|consolas|menlo|fixed|typewriter|code/.test(lowerFont)) {
           fontFamily = "mono";
         } else if (
@@ -392,6 +443,8 @@ export default function EditPdfPage() {
           !/sans/.test(lowerFont)
         ) {
           fontFamily = "serif";
+        } else if (/arial|helvetica|inter|roboto|tahoma|verdana/.test(lowerFont)) {
+          fontFamily = "sans";
         }
 
         const isBold = /bold|black|heavy|demi|semibold|extrabold|-bd|700|800|900/.test(lowerFont);
@@ -399,17 +452,57 @@ export default function EditPdfPage() {
           /italic|oblique|slanted|-it/.test(lowerFont) ||
           Math.abs(item.transform[2]) > 0.08 * fontSize;
 
-        fragments.push({
-          text: item.str,
-          x: vx,
-          yTop,
-          w: Math.max(itemW, fontSize * 0.55),
-          h: itemH,
-          fontSize,
-          fontFamily,
-          isBold,
-          isItalic,
-        });
+        const leadingListMatch = item.str.match(
+          /^(\s*(?:\d+[\.\)]|[a-zA-Z][\.\)]|[•●▪◦\-–—\*]))(\s{2,}|\t+)(.+)$/
+        );
+        if (leadingListMatch) {
+          const markerStr = leadingListMatch[1];
+          const gapSpaces = leadingListMatch[2];
+          const restStr = leadingListMatch[3];
+          const totalLen = Math.max(1, item.str.length);
+          const markerW = itemW * (markerStr.length / totalLen);
+          const gapW = Math.max(fontSize * 0.6, itemW * (gapSpaces.length / totalLen));
+          const restX = vx + markerW + gapW;
+          const restW = Math.max(fontSize, itemW - markerW - gapW);
+
+          fragments.push({
+            text: markerStr.trim(),
+            x: vx,
+            yTop,
+            baselineY: vBaselineY,
+            w: Math.max(markerW, fontSize * 0.6),
+            h: itemH,
+            fontSize,
+            fontFamily,
+            isBold,
+            isItalic,
+          });
+          fragments.push({
+            text: restStr,
+            x: restX,
+            yTop,
+            baselineY: vBaselineY,
+            w: restW,
+            h: itemH,
+            fontSize,
+            fontFamily,
+            isBold,
+            isItalic,
+          });
+        } else {
+          fragments.push({
+            text: item.str,
+            x: vx,
+            yTop,
+            baselineY: vBaselineY,
+            w: Math.max(itemW, fontSize * 0.5),
+            h: itemH,
+            fontSize,
+            fontFamily,
+            isBold,
+            isItalic,
+          });
+        }
       }
 
       fragments.sort((a, b) => {
@@ -419,22 +512,36 @@ export default function EditPdfPage() {
         return a.x - b.x;
       });
 
+      const listMarkerRegex = /^\s*(\d+[\.\)]|[a-zA-Z][\.\)]|[•●▪◦\-–—\*])\s*$/;
       const mergedLines: RawFragment[] = [];
+
       for (const frag of fragments) {
         const last = mergedLines[mergedLines.length - 1];
         const sameBaseline =
-          last && Math.abs(last.yTop - frag.yTop) < Math.min(last.fontSize, frag.fontSize) * 0.42;
+          last &&
+          Math.abs(last.baselineY - frag.baselineY) <
+            Math.min(last.fontSize, frag.fontSize) * 0.42;
         const gap = last ? frag.x - (last.x + last.w) : Infinity;
+
+        const isLastListMarker = Boolean(last && listMarkerRegex.test(last.text));
         const isAdjacentPhrase =
           last &&
+          !(isLastListMarker && gap > frag.fontSize * 0.2) &&
           gap >= -frag.fontSize * 0.35 &&
           gap < Math.max(last.fontSize, frag.fontSize) * 1.75 &&
           Math.abs(last.fontSize - frag.fontSize) <= 2;
 
         if (sameBaseline && isAdjacentPhrase) {
-          const needsSpace =
-            gap > frag.fontSize * 0.15 && !last.text.endsWith(" ") && !frag.text.startsWith(" ");
-          last.text += (needsSpace ? " " : "") + frag.text;
+          let spacer = "";
+          if (!last.text.endsWith(" ") && !frag.text.startsWith(" ")) {
+            if (gap > frag.fontSize * 0.55) {
+              const numSpaces = Math.min(6, Math.max(1, Math.round(gap / (frag.fontSize * 0.27))));
+              spacer = " ".repeat(numSpaces);
+            } else if (gap > frag.fontSize * 0.14) {
+              spacer = " ";
+            }
+          }
+          last.text += spacer + frag.text;
           last.w = Math.max(last.w, frag.x + frag.w - last.x);
           last.h = Math.max(last.h, frag.h);
         } else {
@@ -444,7 +551,7 @@ export default function EditPdfPage() {
 
       return mergedLines.map((ln, idx) => {
         let autoBgHex = "#ffffff";
-        let autoFgHex = "#0f172a";
+        let autoFgHex = "#1f242d";
 
         if (canvasCtx && canvasW && canvasH) {
           const sampled = sampleCanvasColorsForBox(
@@ -460,10 +567,20 @@ export default function EditPdfPage() {
           autoFgHex = sampled.autoFgHex;
         }
 
+        const calibratedPt = calibrateFontSizePt(
+          ln.text,
+          ln.w,
+          ln.fontSize,
+          ln.fontFamily,
+          ln.isBold,
+          ln.isItalic
+        );
+
         const xPct = Math.max(0, Math.min(97, (ln.x / pageW) * 100));
         const yPct = Math.max(0, Math.min(97, (ln.yTop / pageH) * 100));
-        const wPct = Math.max(2, Math.min(100 - xPct, ((ln.w + 3) / pageW) * 100));
-        const hPct = Math.max(1.4, ((ln.h + 2) / pageH) * 100);
+        const baseYPct = Math.max(0, Math.min(99, (ln.baselineY / pageH) * 100));
+        const wPct = Math.max(1.5, Math.min(100 - xPct, ((ln.w + 2) / pageW) * 100));
+        const hPct = Math.max(1.3, ((ln.h + 1.5) / pageH) * 100);
 
         return {
           id: `p${pageNum}_txt_${idx}`,
@@ -473,13 +590,14 @@ export default function EditPdfPage() {
           isNew: false,
           origXPercent: xPct,
           origYPercent: yPct,
+          origBaselineYPercent: baseYPct,
           origWidthPercent: wPct,
           origHeightPercent: hPct,
           xPercent: xPct,
           yPercent: yPct,
           widthPercent: wPct,
           heightPercent: hPct,
-          fontSizePt: Math.round(ln.fontSize),
+          fontSizePt: calibratedPt,
           fontFamily: ln.fontFamily,
           color: autoFgHex,
           isBold: ln.isBold,
@@ -577,7 +695,7 @@ export default function EditPdfPage() {
         const ow = (block.origWidthPercent / 100) * cw;
         const oh = (block.origHeightPercent / 100) * ch;
         ctx.fillStyle = maskHex;
-        ctx.fillRect(Math.max(0, ox - 2), Math.max(0, oy - 2), ow + 4, oh + 4);
+        ctx.fillRect(Math.max(0, ox - 1.5), Math.max(0, oy - 1), ow + 3, oh + 2);
       }
 
       const bx = (block.xPercent / 100) * cw;
@@ -592,20 +710,20 @@ export default function EditPdfPage() {
       }
 
       if (modified && !isSelected && block.currentText.trim()) {
-        const fontPx = Math.max(7, block.fontSizePt) * RENDER_SCALE;
+        const fontPx = Math.max(6.5, block.fontSizePt) * RENDER_SCALE;
         const fontPrefix = `${block.isItalic ? "italic " : ""}${block.isBold ? "bold " : ""}`;
         ctx.font = `${fontPrefix}${fontPx}px ${FONT_CSS_MAP[block.fontFamily]}`;
 
-        const measuredTextW = ctx.measureText(block.currentText).width + 6;
+        const measuredTextW = ctx.measureText(block.currentText).width + 4;
         const fillW = Math.max(bw, measuredTextW);
 
         if (maskHex !== "transparent") {
           ctx.fillStyle = maskHex;
           ctx.fillRect(
-            Math.max(0, bx - 2),
-            Math.max(0, by - 1),
-            fillW + 4,
-            Math.max(bh, fontPx * 1.15) + 2
+            Math.max(0, bx - 1.5),
+            Math.max(0, by - 0.5),
+            fillW + 3,
+            Math.max(bh, fontPx * 1.08) + 1
           );
         }
 
@@ -613,7 +731,11 @@ export default function EditPdfPage() {
         ctx.direction = isRTL ? "rtl" : "ltr";
         ctx.fillStyle = block.color;
         ctx.textBaseline = "alphabetic";
-        const baselineY = by + fontPx * 0.82;
+
+        const movedVertically = Math.abs(block.yPercent - block.origYPercent) > 0.1;
+        const baselineY = movedVertically
+          ? by + fontPx * 0.8
+          : (block.origBaselineYPercent / 100) * ch;
 
         if (isRTL || block.textAlign === "right") {
           ctx.textAlign = "right";
@@ -691,7 +813,7 @@ export default function EditPdfPage() {
                 (b.origWidthPercent / 100) * offscreen.width,
                 (b.origHeightPercent / 100) * offscreen.height
               );
-              const isUnmodifiedColor = b.color === "#0f172a";
+              const isUnmodifiedColor = b.color === "#1f242d" || b.color === "#0f172a";
               return {
                 ...b,
                 autoBgHex: sampled.autoBgHex,
@@ -752,10 +874,10 @@ export default function EditPdfPage() {
     const pageBlocks = textBlocks.filter((b) => b.pageNumber === currentPage);
     const hit = pageBlocks.find(
       (b) =>
-        clickXPct >= b.xPercent - 0.8 &&
-        clickXPct <= b.xPercent + b.widthPercent + 0.8 &&
-        clickYPct >= b.yPercent - 0.6 &&
-        clickYPct <= b.yPercent + b.heightPercent + 0.6
+        clickXPct >= b.xPercent - 0.6 &&
+        clickXPct <= b.xPercent + b.widthPercent + 0.6 &&
+        clickYPct >= b.yPercent - 0.5 &&
+        clickYPct <= b.yPercent + b.heightPercent + 0.5
     );
 
     if (hit) {
@@ -788,15 +910,16 @@ export default function EditPdfPage() {
       isNew: true,
       origXPercent: 25,
       origYPercent: 25,
+      origBaselineYPercent: 26.8,
       origWidthPercent: 28,
       origHeightPercent: 3.5,
       xPercent: 25,
       yPercent: 25,
       widthPercent: 28,
       heightPercent: 3.5,
-      fontSizePt: 14,
-      fontFamily: "sans",
-      color: "#0f172a",
+      fontSizePt: 11,
+      fontFamily: "calibri",
+      color: "#1f242d",
       isBold: false,
       isItalic: false,
       textAlign: "left",
@@ -821,15 +944,16 @@ export default function EditPdfPage() {
       isWhiteoutOnly: true,
       origXPercent: 30,
       origYPercent: 35,
+      origBaselineYPercent: 37,
       origWidthPercent: 28,
       origHeightPercent: 4.5,
       xPercent: 30,
       yPercent: 35,
       widthPercent: 28,
       heightPercent: 4.5,
-      fontSizePt: 12,
-      fontFamily: "sans",
-      color: "#0f172a",
+      fontSizePt: 11,
+      fontFamily: "calibri",
+      color: "#1f242d",
       isBold: false,
       isItalic: false,
       textAlign: "left",
@@ -1034,14 +1158,14 @@ export default function EditPdfPage() {
     const SCALE = 3;
     const measureCanvas = document.createElement("canvas");
     const mCtx = measureCanvas.getContext("2d")!;
-    const fontPx = Math.max(7, block.fontSizePt) * SCALE;
+    const fontPx = Math.max(6.5, block.fontSizePt) * SCALE;
     const fontStylePrefix = `${block.isItalic ? "italic " : ""}${block.isBold ? "bold " : ""}`;
     const fontSpec = `${fontStylePrefix}${fontPx}px ${FONT_CSS_MAP[block.fontFamily]}`;
     mCtx.font = fontSpec;
 
-    const measuredW = mCtx.measureText(block.currentText).width + 6 * SCALE;
+    const measuredW = mCtx.measureText(block.currentText).width + 4 * SCALE;
     const finalW = Math.max(boxWidthPt * SCALE, measuredW);
-    const finalH = Math.max(boxHeightPt * SCALE, fontPx * 1.18);
+    const finalH = Math.max(boxHeightPt * SCALE, fontPx * 1.12);
 
     const canvas = document.createElement("canvas");
     canvas.width = Math.max(1, Math.ceil(finalW));
@@ -1056,7 +1180,7 @@ export default function EditPdfPage() {
     ctx.fillStyle = block.color;
     ctx.textBaseline = "alphabetic";
 
-    const baselineY = fontPx * 0.82;
+    const baselineY = fontPx * 0.8;
 
     if (isRTL || block.textAlign === "right") {
       ctx.textAlign = "right";
@@ -1135,10 +1259,10 @@ export default function EditPdfPage() {
             const { r, g, b } = hexToRgbComponents(maskHex);
 
             page.drawRectangle({
-              x: Math.max(0, origX - 1.5),
-              y: Math.max(0, origY - 1.5),
-              width: origW + 3,
-              height: origH + 3,
+              x: Math.max(0, origX - 1),
+              y: Math.max(0, origY - 1),
+              width: origW + 2,
+              height: origH + 2,
               color: rgb(r, g, b),
             });
           }
@@ -1205,10 +1329,10 @@ export default function EditPdfPage() {
             if (!b.isNew && mHex !== "transparent") {
               ctx.fillStyle = mHex;
               ctx.fillRect(
-                (b.origXPercent / 100) * cnv.width - 2,
-                (b.origYPercent / 100) * cnv.height - 2,
-                (b.origWidthPercent / 100) * cnv.width + 4,
-                (b.origHeightPercent / 100) * cnv.height + 4
+                (b.origXPercent / 100) * cnv.width - 1.5,
+                (b.origYPercent / 100) * cnv.height - 1,
+                (b.origWidthPercent / 100) * cnv.width + 3,
+                (b.origHeightPercent / 100) * cnv.height + 2
               );
             }
             if (!b.isWhiteoutOnly && b.currentText.trim()) {
@@ -1218,11 +1342,11 @@ export default function EditPdfPage() {
               }`;
               ctx.fillStyle = b.color;
               ctx.textBaseline = "alphabetic";
-              ctx.fillText(
-                b.currentText,
-                (b.xPercent / 100) * cnv.width,
-                (b.yPercent / 100) * cnv.height + fPx * 0.82
-              );
+              const movedV = Math.abs(b.yPercent - b.origYPercent) > 0.1;
+              const baseLine = movedV
+                ? (b.yPercent / 100) * cnv.height + fPx * 0.8
+                : (b.origBaselineYPercent / 100) * cnv.height;
+              ctx.fillText(b.currentText, (b.xPercent / 100) * cnv.width, baseLine);
             }
           }
 
@@ -1420,7 +1544,7 @@ export default function EditPdfPage() {
               </div>
             </div>
 
-            {/* Find & Replace Bar (Auto-fills when you click any text line on the PDF) */}
+            {/* Find & Replace Bar */}
             {showFindReplace && (
               <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white p-3 text-xs shadow-xs dark:border-slate-800 dark:bg-slate-900">
                 <div className="flex flex-wrap items-center gap-2 flex-1">
@@ -1429,24 +1553,24 @@ export default function EditPdfPage() {
                     <span>Find & Replace:</span>
                   </span>
 
-                  <div className="flex items-center gap-1.5 rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1.5 dark:border-slate-700 dark:bg-slate-800">
-                    <Search className="h-3.5 w-3.5 text-slate-400" />
+                  <div className="flex items-center gap-1.5 rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1.5 flex-1 min-w-[180px] dark:border-slate-700 dark:bg-slate-800">
+                    <Search className="h-3.5 w-3.5 text-slate-400 shrink-0" />
                     <input
                       type="text"
                       value={findQuery}
                       onChange={(e) => setFindQuery(e.target.value)}
                       placeholder="Click a line or type text to find..."
-                      className="w-40 sm:w-52 bg-transparent text-xs text-slate-900 dark:text-white outline-none"
+                      className="w-full bg-transparent text-xs text-slate-900 dark:text-white outline-none"
                     />
                     {findQuery && (
-                      <span className="rounded bg-rose-100 px-1.5 py-0.5 font-mono text-[10px] font-bold text-rose-700 dark:bg-rose-950 dark:text-rose-300">
+                      <span className="rounded bg-rose-100 px-1.5 py-0.5 font-mono text-[10px] font-bold text-rose-700 shrink-0 dark:bg-rose-950 dark:text-rose-300">
                         {matchingBlocks.length} match{matchingBlocks.length === 1 ? "" : "es"}
                       </span>
                     )}
                   </div>
 
-                  <div className="flex items-center gap-1.5 rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1.5 dark:border-slate-700 dark:bg-slate-800">
-                    <Replace className="h-3.5 w-3.5 text-slate-400" />
+                  <div className="flex items-center gap-1.5 rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1.5 flex-1 min-w-[180px] dark:border-slate-700 dark:bg-slate-800">
+                    <Replace className="h-3.5 w-3.5 text-slate-400 shrink-0" />
                     <input
                       type="text"
                       value={replaceQuery}
@@ -1457,7 +1581,7 @@ export default function EditPdfPage() {
                         }
                       }}
                       placeholder="Replace with..."
-                      className="w-40 sm:w-52 bg-transparent text-xs text-slate-900 dark:text-white outline-none"
+                      className="w-full bg-transparent text-xs text-slate-900 dark:text-white outline-none"
                     />
                   </div>
 
@@ -1524,9 +1648,9 @@ export default function EditPdfPage() {
                         Selected Line Edit:
                       </span>
 
-                      <div className="flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 flex-1 min-w-[220px] dark:border-slate-700 dark:bg-slate-900">
+                      <div className="flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 flex-1 min-w-[240px] dark:border-slate-700 dark:bg-slate-900">
                         <span className="text-[10px] font-mono uppercase text-slate-400 shrink-0">
-                          Text:
+                          Full Text:
                         </span>
                         <input
                           type="text"
@@ -1553,7 +1677,7 @@ export default function EditPdfPage() {
                         className="inline-flex items-center gap-1 rounded-lg bg-rose-600 hover:bg-rose-500 px-3 py-1.5 font-bold text-white shadow-xs"
                       >
                         <Check className="h-3.5 w-3.5" />
-                        <span>Apply & Preview on Page</span>
+                        <span>Apply & Preview</span>
                       </button>
                     </div>
                   </div>
@@ -1580,24 +1704,26 @@ export default function EditPdfPage() {
                           aria-label="Font Family"
                           className="rounded border border-slate-200 bg-white px-2 py-1 text-xs font-medium text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-white"
                         >
-                          <option value="sans">Sans-Serif (Helvetica / Inter)</option>
-                          <option value="serif">Serif (Times / Georgia)</option>
-                          <option value="mono">Monospace (Courier)</option>
+                          <option value="calibri">Calibri / Word Default</option>
+                          <option value="sans">Arial / Helvetica (Sans)</option>
+                          <option value="serif">Times / Georgia (Serif)</option>
+                          <option value="mono">Courier (Monospace)</option>
                         </select>
 
                         <div className="flex items-center gap-1">
                           <span className="text-slate-500">Size:</span>
                           <input
                             type="number"
+                            step="0.5"
                             min={6}
                             max={72}
                             value={selectedBlock.fontSizePt}
                             onChange={(e) =>
                               handleUpdateBlock(selectedBlock.id, {
-                                fontSizePt: Math.max(6, Math.min(72, Number(e.target.value) || 12)),
+                                fontSizePt: Math.max(6, Math.min(72, Number(e.target.value) || 11)),
                               })
                             }
-                            className="w-14 rounded border border-slate-200 bg-white px-2 py-1 font-mono text-xs text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-white"
+                            className="w-16 rounded border border-slate-200 bg-white px-2 py-1 font-mono text-xs text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-white"
                           />
                         </div>
 
@@ -1668,7 +1794,7 @@ export default function EditPdfPage() {
                         <div className="flex items-center gap-1.5">
                           <span className="text-slate-500">Ink:</span>
                           {[
-                            { hex: "#0f172a", label: "Black / Slate" },
+                            { hex: "#1f242d", label: "PDF Charcoal / Black" },
                             { hex: "#1d4ed8", label: "Royal Blue" },
                             { hex: "#dc2626", label: "Crimson Red" },
                             { hex: "#059669", label: "Emerald Green" },
@@ -1829,7 +1955,7 @@ export default function EditPdfPage() {
               </div>
             )}
 
-            {/* Interactive PDF Page Viewport (block + h-fit so overlay height 100% matches canvas height) */}
+            {/* Interactive PDF Page Viewport */}
             <div
               onClick={handleCanvasDirectClick}
               className="relative block overflow-auto rounded-2xl border border-slate-200 bg-slate-100 p-4 max-h-[82vh] dark:border-slate-800 dark:bg-slate-950"
@@ -1865,7 +1991,7 @@ export default function EditPdfPage() {
                   }
 
                   const maskHex = resolveMaskHex(block);
-                  const scaledFontPx = Math.max(9, block.fontSizePt * displayScale);
+                  const scaledFontPx = Math.max(8.5, block.fontSizePt * displayScale);
 
                   return (
                     <div
@@ -1931,31 +2057,63 @@ export default function EditPdfPage() {
                           {isSelected ? "Drag or Resize Mask" : ""}
                         </div>
                       ) : isSelected ? (
-                        <input
-                          type="text"
-                          autoFocus
-                          value={block.currentText}
-                          onChange={(e) => {
-                            const val = e.target.value;
-                            handleUpdateBlock(block.id, { currentText: val });
-                            setSelectedReplaceSubstr(val);
-                            setReplaceQuery(val);
-                          }}
-                          onKeyDown={(e) => {
-                            if (e.key === "Enter") {
-                              handleSelectBlock(null);
-                            }
-                          }}
+                        /* Auto-expanding inline-grid so 100% of the text is always visible without horizontal scrolling */
+                        <div className="inline-grid w-full items-center">
+                          <span
+                            aria-hidden="true"
+                            style={{
+                              fontFamily: FONT_CSS_MAP[block.fontFamily],
+                              fontWeight: block.isBold ? 700 : 400,
+                              fontStyle: block.isItalic ? "italic" : "normal",
+                              fontSize: `${scaledFontPx}px`,
+                            }}
+                            className="invisible col-start-1 row-start-1 whitespace-pre px-2 pointer-events-none select-none leading-none"
+                          >
+                            {block.currentText || " "}
+                          </span>
+                          <input
+                            type="text"
+                            autoFocus
+                            value={block.currentText}
+                            onFocus={(e) => {
+                              e.currentTarget.scrollLeft = 0;
+                            }}
+                            onChange={(e) => {
+                              const val = e.target.value;
+                              handleUpdateBlock(block.id, { currentText: val });
+                              setSelectedReplaceSubstr(val);
+                              setReplaceQuery(val);
+                            }}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") {
+                                handleSelectBlock(null);
+                              }
+                            }}
+                            style={{
+                              color: block.color,
+                              fontFamily: FONT_CSS_MAP[block.fontFamily],
+                              fontWeight: block.isBold ? 700 : 400,
+                              fontStyle: block.isItalic ? "italic" : "normal",
+                              fontSize: `${scaledFontPx}px`,
+                              textAlign: block.textAlign,
+                            }}
+                            className="col-start-1 row-start-1 w-full min-w-full bg-transparent outline-none leading-none px-0.5"
+                          />
+                        </div>
+                      ) : isModified ? (
+                        /* Invisible sizer keeps the green dashed box wrapping 100% of edited text width */
+                        <span
+                          aria-hidden="true"
                           style={{
-                            color: block.color,
                             fontFamily: FONT_CSS_MAP[block.fontFamily],
                             fontWeight: block.isBold ? 700 : 400,
                             fontStyle: block.isItalic ? "italic" : "normal",
                             fontSize: `${scaledFontPx}px`,
-                            textAlign: block.textAlign,
                           }}
-                          className="w-full bg-transparent outline-none leading-none px-0.5"
-                        />
+                          className="invisible whitespace-pre px-1 pointer-events-none select-none leading-none"
+                        >
+                          {block.currentText || " "}
+                        </span>
                       ) : (
                         <span
                           title={`Click to edit: "${block.currentText}" (${block.fontFamily}, ${block.fontSizePt}pt)`}
