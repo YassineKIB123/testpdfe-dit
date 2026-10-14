@@ -1,95 +1,183 @@
 "use client";
 
-import React, { useState, useRef, useEffect, useCallback, useMemo } from "react";
-import Link from "next/link";
+import React, { useState, useRef, useEffect, useCallback } from "react";
 import { ToolLayout } from "@/components/tools/ToolLayout";
 import { FileDropzone } from "@/components/tools/FileDropzone";
 import { downloadBlob, loadPdfJs } from "@/lib/pdf/pdf-utils";
-import { PDFDocument, rgb } from "pdf-lib";
+import { PDFDocument } from "pdf-lib";
 import {
-  FileEdit,
   Type,
+  Link as LinkIcon,
+  CheckSquare,
+  Image as ImageIcon,
+  PenTool,
   Eraser,
-  ChevronLeft,
-  ChevronRight,
-  Loader2,
-  Download,
-  AlertCircle,
-  CheckCircle2,
-  Trash2,
-  RotateCcw,
-  Plus,
-  Bold,
-  Italic,
+  Highlighter,
+  Shapes,
   Undo2,
   Redo2,
-  Search,
-  Replace,
+  Palette,
+  Move,
+  Copy,
+  Trash2,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   ZoomIn,
   ZoomOut,
-  Eye,
-  EyeOff,
-  Move,
-  AlignLeft,
-  AlignCenter,
-  AlignRight,
-  ScanText,
-  MousePointerClick,
+  Search,
+  Replace,
+  Check,
+  X,
+  Loader2,
+  Download,
+  Square,
+  Circle,
+  Minus,
+  ArrowRight,
 } from "lucide-react";
 
-export type PdfFontFamily = "calibri" | "sans" | "serif" | "mono";
-export type MaskBgMode = "auto" | "white" | "cream" | "black" | "transparent" | "custom";
-export type TextAlignMode = "left" | "center" | "right";
-export type SelectionGranularity = "word" | "line" | "paragraph";
+// ============================================================================
+// MODULE 1: TYPES & FONT / TEXT-LAYER ENGINE
+// ============================================================================
 
-export interface TextBlockItem {
+export type SejdaToolMode =
+  | "text"
+  | "links"
+  | "forms"
+  | "images"
+  | "sign"
+  | "whiteout"
+  | "annotate"
+  | "shapes";
+
+export type FormSubTool = "check" | "cross" | "dot" | "textfield";
+export type AnnotateSubTool = "highlight" | "strike" | "underline" | "freehand";
+export type ShapeSubTool = "rect" | "ellipse" | "line" | "arrow";
+
+export type EditorFontId =
+  | "serif"
+  | "cambria"
+  | "times"
+  | "calibri"
+  | "arial"
+  | "mono";
+
+export const EDITOR_FONTS: { id: EditorFontId; label: string; css: string }[] = [
+  {
+    id: "serif",
+    label: "Computer Modern / Serif",
+    css: '"Computer Modern Serif", "Latin Modern Roman", Georgia, "Times New Roman", serif',
+  },
+  {
+    id: "cambria",
+    label: "Cambria / Caladea",
+    css: 'Cambria, Caladea, Georgia, "Times New Roman", serif',
+  },
+  {
+    id: "times",
+    label: "Times New Roman",
+    css: '"Times New Roman", Times, Tinos, Georgia, serif',
+  },
+  {
+    id: "calibri",
+    label: "Calibri / Carlito",
+    css: 'Calibri, Carlito, "Segoe UI", Candara, Arial, sans-serif',
+  },
+  {
+    id: "arial",
+    label: "Arial / Helvetica",
+    css: 'Arial, Helvetica, "Liberation Sans", Arimo, sans-serif',
+  },
+  {
+    id: "mono",
+    label: "Courier / Monospace",
+    css: '"Computer Modern Typewriter", "Courier New", Courier, Consolas, monospace',
+  },
+];
+
+export function getFontCss(fontId: EditorFontId): string {
+  return EDITOR_FONTS.find((f) => f.id === fontId)?.css || EDITOR_FONTS[0].css;
+}
+
+export interface LiveTextLine {
   id: string;
   pageNumber: number;
   originalText: string;
-  currentText: string;
+  text: string;
   isNew: boolean;
-  isWhiteoutOnly?: boolean;
-  isMultiline?: boolean;
-  lineHeightPt?: number;
-  rawFontSizePt: number;
-  origXPercent: number;
-  origYPercent: number;
-  origBaselineYPercent: number;
-  origWidthPercent: number;
-  origHeightPercent: number;
-  xPercent: number;
-  yPercent: number;
-  widthPercent: number;
-  heightPercent: number;
-  // Locked original typography from the PDF
-  origFontSizePt: number;
-  origFontFamily: PdfFontFamily;
-  origColor: string;
-  origIsBold: boolean;
-  origIsItalic: boolean;
-  // Active typography
+  // Position & bounds in PDF points (scale 1.0)
+  origXPt: number;
+  origYPt: number;
+  origBaselineYPt: number;
+  origWidthPt: number;
+  origHeightPt: number;
+  xPt: number;
+  yPt: number;
+  widthPt: number;
+  heightPt: number;
+  // Locked PDF typography
   fontSizePt: number;
-  fontFamily: PdfFontFamily;
+  fontId: EditorFontId;
   color: string;
   isBold: boolean;
   isItalic: boolean;
-  textAlign: TextAlignMode;
-  maskBg: MaskBgMode;
-  autoBgHex: string;
-  customMaskHex: string;
+  linkUrl?: string;
+  bgHex: string;
 }
 
-const FONT_CSS_MAP: Record<PdfFontFamily, string> = {
-  serif:
-    '"Computer Modern Serif", "Latin Modern Roman", "Times New Roman", Times, Georgia, Cambria, serif',
-  calibri: 'Calibri, Carlito, "Segoe UI", Candara, Arial, sans-serif',
-  sans: '"Computer Modern Sans", Arial, Helvetica, "Liberation Sans", system-ui, sans-serif',
-  mono: '"Computer Modern Typewriter", "Courier New", Courier, Consolas, Menlo, monospace',
-};
+export interface OverlayItem {
+  id: string;
+  pageNumber: number;
+  kind:
+    | "whiteout"
+    | "highlight"
+    | "strike"
+    | "underline"
+    | "link"
+    | "rect"
+    | "ellipse"
+    | "line"
+    | "arrow"
+    | "check"
+    | "cross"
+    | "dot"
+    | "textfield"
+    | "image"
+    | "signature"
+    | "freehand";
+  xPt: number;
+  yPt: number;
+  wPt: number;
+  hPt: number;
+  color: string;
+  fillColor?: string;
+  strokeWidthPt?: number;
+  text?: string;
+  linkUrl?: string;
+  dataUrl?: string;
+  points?: { x: number; y: number }[];
+}
 
-const RENDER_SCALE = 1.6;
+interface EditorSnapshot {
+  lines: LiveTextLine[];
+  overlays: OverlayItem[];
+}
 
-function multiplyTransform(m1: number[], m2: number[]): number[] {
+const BG_RENDER_SCALE = 2.0;
+
+const PRESET_COLORS = [
+  "#000000",
+  "#1e293b",
+  "#dc2626",
+  "#2563eb",
+  "#16a34a",
+  "#d97706",
+  "#7c3aed",
+  "#ffffff",
+];
+
+function multiplyMatrix(m1: number[], m2: number[]): number[] {
   return [
     m1[0] * m2[0] + m1[2] * m2[1],
     m1[1] * m2[0] + m1[3] * m2[1],
@@ -100,179 +188,139 @@ function multiplyTransform(m1: number[], m2: number[]): number[] {
   ];
 }
 
-function hexToRgbComponents(hex: string): { r: number; g: number; b: number } {
-  const clean = hex.replace("#", "").trim();
-  if (clean.length !== 6) return { r: 1, g: 1, b: 1 };
-  const num = parseInt(clean, 16);
-  if (Number.isNaN(num)) return { r: 1, g: 1, b: 1 };
-  return {
-    r: ((num >> 16) & 255) / 255,
-    g: ((num >> 8) & 255) / 255,
-    b: (num & 255) / 255,
-  };
-}
-
 function rgbToHex(r: number, g: number, b: number): string {
-  const clamp = (n: number) => Math.max(0, Math.min(255, Math.round(n)));
+  const c = (n: number) => Math.max(0, Math.min(255, Math.round(n)));
   return (
     "#" +
-    [clamp(r), clamp(g), clamp(b)]
+    [c(r), c(g), c(b)]
       .map((v) => v.toString(16).padStart(2, "0"))
       .join("")
   );
 }
 
-function dataUrlToUint8Array(dataUrl: string): Uint8Array {
+function dataUrlToBytes(dataUrl: string): Uint8Array {
   const parts = dataUrl.split(",");
   const base64 = parts.length > 1 ? parts[1] : parts[0];
-  const binaryString = atob(base64);
-  const bytes = new Uint8Array(binaryString.length);
-  for (let i = 0; i < binaryString.length; i++) {
-    bytes[i] = binaryString.charCodeAt(i);
+  const bin = atob(base64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) {
+    out[i] = bin.charCodeAt(i);
   }
-  return bytes;
+  return out;
 }
 
-function detectDocumentDefaultFontFromBytes(buffer: ArrayBuffer): PdfFontFamily {
+function detectDefaultFontFromPdfBuffer(buffer: ArrayBuffer): EditorFontId {
   try {
     const slice = buffer.slice(0, Math.min(buffer.byteLength, 2 * 1024 * 1024));
     const ascii = new TextDecoder("latin1").decode(slice);
     const matches = ascii.match(/\/BaseFont\s*\/([^\s\/\[\]<>()]+)/g) || [];
-    let serifScore = 0;
+    let cmScore = 0;
+    let cambriaScore = 0;
+    let timesScore = 0;
     let calibriScore = 0;
-    let sansScore = 0;
+    let arialScore = 0;
 
     for (const raw of matches) {
       const name = raw.toLowerCase();
-      if (
-        /cmr|cmbx|cmti|cmsl|cmcsc|cmmi|sfrm|sfbx|sfti|sfsl|lmroman|times|georgia|garamond|cambria|palatino|baskerville|nimbusrom|termes|pagella|bonum|schola|libertine|libertinus|charter|bookman|century|utopia|fourier|stix|xits|serif/.test(
-          name
-        ) &&
-        !/sans|cmss|sfss|lmsans/.test(name)
-      ) {
-        serifScore += 2;
-      } else if (/calibri|carlito|aptos|candara|corbel|segoe/.test(name)) {
+      if (/cmr|cmbx|cmti|cmsl|cmcsc|sfrm|sfbx|sfti|lmroman/.test(name)) {
+        cmScore += 2;
+      } else if (/cambria|caladea|georgia|palatino|garamond|charter/.test(name)) {
+        cambriaScore += 2;
+      } else if (/times|nimbusrom|termes/.test(name)) {
+        timesScore += 2;
+      } else if (/calibri|carlito|aptos|candara|segoe/.test(name)) {
         calibriScore += 2;
-      } else if (/arial|helvetica|inter|roboto|tahoma|verdana|cmss|sfss|lmsans|sans/.test(name)) {
-        sansScore += 1;
+      } else if (/arial|helvetica|inter|roboto|verdana|tahoma|sans/.test(name)) {
+        arialScore += 1;
       }
     }
 
-    if (serifScore > 0 && serifScore >= calibriScore && serifScore >= sansScore) {
-      return "serif";
-    }
-    if (calibriScore > 0 && calibriScore >= sansScore) {
-      return "calibri";
-    }
-    if (sansScore > 0) {
-      return "sans";
-    }
-    return "serif";
+    const maxScore = Math.max(cmScore, cambriaScore, timesScore, calibriScore, arialScore);
+    if (maxScore === 0) return "cambria";
+    if (cambriaScore === maxScore) return "cambria";
+    if (cmScore === maxScore) return "serif";
+    if (timesScore === maxScore) return "times";
+    if (calibriScore === maxScore) return "calibri";
+    return "arial";
   } catch {
-    return "serif";
+    return "cambria";
   }
 }
 
-/**
- * Classifies PDF font metadata after stripping 6-letter subset prefixes (e.g. "ABCDEF+SFRM1000")
- * and avoiding numeric false positives ("700"/"800"/"900" in CM-Super font names).
- */
-function classifyPdfFontMetadata(
-  realFontName: string,
-  fallbackStyleFamily: string,
-  transformShear: number,
+function classifyFontItem(
+  rawFontName: string,
+  styleFamily: string,
+  shear: number,
   fontSize: number,
-  docDefaultFamily: PdfFontFamily,
+  defaultFontId: EditorFontId,
   fObj?: any
-): { fontFamily: PdfFontFamily; isBold: boolean; isItalic: boolean } {
-  // Strip 6-uppercase-letter PDF subset tags like "X700AB+"
-  const cleanedName = realFontName
+): { fontId: EditorFontId; isBold: boolean; isItalic: boolean } {
+  const cleaned = rawFontName
     .replace(/\b[A-Z]{6}\+/g, "")
     .replace(/\bg_d\d+_f\d+\b/gi, "")
     .toLowerCase();
-  const lowerStyle = fallbackStyleFamily.toLowerCase();
+  const lowerStyle = styleFamily.toLowerCase();
 
-  let fontFamily: PdfFontFamily = docDefaultFamily;
-
+  let fontId: EditorFontId = defaultFontId;
   if (
     Boolean(fObj?.isMonospace) ||
-    /mono|courier|consolas|menlo|fixed|typewriter|code|cmtt|sftt|lmmono/.test(cleanedName) ||
+    /mono|courier|consolas|menlo|typewriter|cmtt|sftt|lmmono/.test(cleaned) ||
     lowerStyle === "monospace"
   ) {
-    fontFamily = "mono";
-  } else if (
-    Boolean(fObj?.isSerifFont) ||
-    (/serif|times|georgia|garamond|cambria|palatino|mincho|baskerville|cmr|cmbx|cmti|cmsl|cmcsc|cmmi|sfrm|sfbx|sfti|sfsl|sfcsc|lmroman|nimbusrom|termes|pagella|bonum|schola|libertine|libertinus|charter|bookman|century|utopia|fourier|stix|xits|crimson|merriweather|bodoni|caslon|didot|constantia/.test(
-      cleanedName
-    ) &&
-      !/sans|cmss|sfss|lmsans/.test(cleanedName)) ||
-    lowerStyle === "serif"
-  ) {
-    fontFamily = "serif";
-  } else if (/calibri|carlito|aptos|candara|corbel|segoe/.test(cleanedName)) {
-    fontFamily = "calibri";
-  } else if (
-    /arial|helvetica|inter|roboto|tahoma|verdana|cmss|sfss|lmsans|dejavusans|liberationsans/.test(
-      cleanedName
-    )
-  ) {
-    fontFamily = "sans";
+    fontId = "mono";
+  } else if (/cmr|cmbx|cmti|cmsl|sfrm|sfbx|sfti|lmroman/.test(cleaned)) {
+    fontId = "serif";
+  } else if (/cambria|caladea|georgia|palatino|garamond/.test(cleaned)) {
+    fontId = "cambria";
+  } else if (/times|nimbusrom|termes/.test(cleaned)) {
+    fontId = "times";
+  } else if (/calibri|carlito|aptos|candara|segoe/.test(cleaned)) {
+    fontId = "calibri";
+  } else if (/arial|helvetica|inter|roboto|verdana|tahoma|cmss|sfss|lmsans/.test(cleaned)) {
+    fontId = "arial";
+  } else if (lowerStyle === "serif" && (defaultFontId === "calibri" || defaultFontId === "arial")) {
+    fontId = "cambria";
   }
 
   const isBold =
     /(?:^|[-_\s])(bold|black|heavy|demi|semibold|extrabold)|-bd\b|cmbx|sfbx|lmroman.*bold|nimbusrom.*(bold|medi)/i.test(
-      cleanedName
+      cleaned
     );
 
   const isItalic =
     Boolean(fObj?.italic) ||
-    /italic|oblique|slanted|-it\b|cmti|sfti|cmsl|sfsl|cmmi|lmroman.*italic/.test(cleanedName) ||
-    Math.abs(transformShear) > 0.08 * fontSize;
+    /italic|oblique|slanted|-it\b|cmti|sfti|cmsl|sfsl|cmmi|lmroman.*italic/.test(cleaned) ||
+    Math.abs(shear) > 0.08 * fontSize;
 
-  return { fontFamily, isBold, isItalic };
+  return { fontId, isBold, isItalic };
 }
 
 /**
- * Samples the rendered PDF canvas for:
- * 1) Background paper color (`autoBgHex`)
- * 2) Optical ink color (`autoFgHex`) calibrated to match the actual stroke density of the PDF glyphs
- * 3) Horizontal stem-width measurement (`pixelIsThinRegular`, `pixelIsThickBold`) so regular 1px-stem text
- *    is guaranteed never to become Bold, while true thick-stemmed headings stay Bold.
+ * Samples the rendered PDF canvas at `box` to extract:
+ * - Paper background color (`bgHex`)
+ * - True ink color (`fgHex`, e.g. `#000000` or colored heading ink)
+ * - Horizontal stem thickness (`isThinRegular`, `isThickBold`)
  */
-function sampleCanvasStyleForBox(
+function sampleBoxFromFullCanvas(
   ctx: CanvasRenderingContext2D,
-  canvasW: number,
-  canvasH: number,
-  boxXPx: number,
-  boxYPx: number,
-  boxWPx: number,
-  boxHPx: number,
+  cw: number,
+  ch: number,
+  xPx: number,
+  yPx: number,
+  wPx: number,
+  hPx: number,
   fontPx: number
-): {
-  autoBgHex: string;
-  autoFgHex: string;
-  pixelIsSerif: boolean;
-  pixelIsThinRegular: boolean;
-  pixelIsThickBold: boolean;
-} {
+): { bgHex: string; fgHex: string; isThinRegular: boolean; isThickBold: boolean } {
   try {
-    const pad = 2;
-    const sx = Math.max(0, Math.floor(boxXPx - pad));
-    const sy = Math.max(0, Math.floor(boxYPx - pad));
-    const sw = Math.min(canvasW - sx, Math.ceil(boxWPx + pad * 2));
-    const sh = Math.min(canvasH - sy, Math.ceil(boxHPx + pad * 2));
-
+    const sx = Math.max(0, Math.floor(xPx - 2));
+    const sy = Math.max(0, Math.floor(yPx - 2));
+    const sw = Math.min(cw - sx, Math.ceil(wPx + 4));
+    const sh = Math.min(ch - sy, Math.ceil(hPx + 4));
     if (sw <= 3 || sh <= 3) {
-      return {
-        autoBgHex: "#ffffff",
-        autoFgHex: "#2e3138",
-        pixelIsSerif: false,
-        pixelIsThinRegular: true,
-        pixelIsThickBold: false,
-      };
+      return { bgHex: "#ffffff", fgHex: "#000000", isThinRegular: true, isThickBold: false };
     }
 
-    const imgData = ctx.getImageData(sx, sy, sw, sh).data;
+    const data = ctx.getImageData(sx, sy, sw, sh).data;
     const edgeR: number[] = [];
     const edgeG: number[] = [];
     const edgeB: number[] = [];
@@ -280,9 +328,9 @@ function sampleCanvasStyleForBox(
     for (let x = 0; x < sw; x += 2) {
       for (const y of [0, sh - 1]) {
         const idx = (y * sw + x) * 4;
-        edgeR.push(imgData[idx]);
-        edgeG.push(imgData[idx + 1]);
-        edgeB.push(imgData[idx + 2]);
+        edgeR.push(data[idx]);
+        edgeG.push(data[idx + 1]);
+        edgeB.push(data[idx + 2]);
       }
     }
 
@@ -299,559 +347,276 @@ function sampleCanvasStyleForBox(
       bgB = edgeB[mid];
     }
 
-    const inkPixels: { r: number; g: number; b: number; dist: number }[] = [];
-    const rowInkCounts: number[] = new Array(sh).fill(0);
-    const horizontalRuns: number[] = [];
+    const ink: { r: number; g: number; b: number; dist: number }[] = [];
+    const runs: number[] = [];
 
     for (let y = 1; y < sh - 1; y++) {
-      let currentRun = 0;
+      let run = 0;
       for (let x = 1; x < sw - 1; x++) {
         const idx = (y * sw + x) * 4;
-        const r = imgData[idx];
-        const g = imgData[idx + 1];
-        const b = imgData[idx + 2];
+        const r = data[idx];
+        const g = data[idx + 1];
+        const b = data[idx + 2];
         const dist = Math.abs(r - bgR) + Math.abs(g - bgG) + Math.abs(b - bgB);
-        if (dist > 75) {
-          inkPixels.push({ r, g, b, dist });
-          rowInkCounts[y]++;
+        if (dist > 80) {
+          ink.push({ r, g, b, dist });
         }
-        if (dist > 105) {
-          currentRun++;
-        } else if (currentRun > 0) {
-          horizontalRuns.push(currentRun);
-          currentRun = 0;
+        if (dist > 110) {
+          run++;
+        } else if (run > 0) {
+          runs.push(run);
+          run = 0;
         }
       }
-      if (currentRun > 0) {
-        horizontalRuns.push(currentRun);
-      }
+      if (run > 0) runs.push(run);
     }
 
-    if (inkPixels.length === 0) {
+    if (ink.length === 0) {
       return {
-        autoBgHex: rgbToHex(bgR, bgG, bgB),
-        autoFgHex: "#2e3138",
-        pixelIsSerif: false,
-        pixelIsThinRegular: true,
-        pixelIsThickBold: false,
+        bgHex: rgbToHex(bgR, bgG, bgB),
+        fgHex: "#000000",
+        isThinRegular: true,
+        isThickBold: false,
       };
     }
 
-    // Measure horizontal stem run lengths to distinguish thin Regular stems (~1.5px) from Bold stems (~2.3px+)
-    let meanRun = 1.5;
+    let meanRun = 1.6;
     let medianRun = 1.0;
-    if (horizontalRuns.length >= 4) {
-      horizontalRuns.sort((a, b) => a - b);
-      meanRun = horizontalRuns.reduce((a, b) => a + b, 0) / horizontalRuns.length;
-      medianRun = horizontalRuns[Math.floor(horizontalRuns.length * 0.5)];
+    if (runs.length >= 4) {
+      runs.sort((a, b) => a - b);
+      meanRun = runs.reduce((a, b) => a + b, 0) / runs.length;
+      medianRun = runs[Math.floor(runs.length * 0.5)];
     }
 
-    const pixelIsThinRegular = medianRun <= 1.2 && meanRun < Math.max(1.88, fontPx * 0.118);
-    const pixelIsThickBold = medianRun >= 2.0 && meanRun >= Math.max(2.15, fontPx * 0.132);
+    const isThinRegular = medianRun <= 1.5 && meanRun < Math.max(2.2, fontPx * 0.118);
+    const isThickBold = medianRun >= 2.0 && meanRun >= Math.max(2.5, fontPx * 0.135);
 
-    inkPixels.sort((a, b) => b.dist - a.dist);
+    ink.sort((a, b) => b.dist - a.dist);
+    const top = ink[0];
+    const sat = Math.max(top.r, top.g, top.b) - Math.min(top.r, top.g, top.b);
 
-    const topPixel = inkPixels[0];
-    const colorSat =
-      Math.max(topPixel.r, topPixel.g, topPixel.b) -
-      Math.min(topPixel.r, topPixel.g, topPixel.b);
-
-    // Sample the 20th..50th percentile of ink pixels so anti-aliased thin serif stems match optical grayness
-    const startRatio = colorSat > 35 ? 0.05 : 0.20;
-    const endRatio = colorSat > 35 ? 0.30 : 0.50;
-    const startIdx = Math.floor(inkPixels.length * startRatio);
-    const endIdx = Math.max(startIdx + 1, Math.floor(inkPixels.length * endRatio));
-
-    let sumR = 0,
-      sumG = 0,
-      sumB = 0;
-    for (let i = startIdx; i < endIdx; i++) {
-      sumR += inkPixels[i].r;
-      sumG += inkPixels[i].g;
-      sumB += inkPixels[i].b;
-    }
-    const count = Math.max(1, endIdx - startIdx);
-    let fgR = sumR / count;
-    let fgG = sumG / count;
-    let fgB = sumB / count;
-
-    const bgLum = (bgR + bgG + bgB) / 3;
-    const fgLum = (fgR + fgG + fgB) / 3;
-    if (bgLum > 200 && colorSat <= 30) {
-      // Thin regular PDF stems look lighter optically (~#2d3036) than thick bold headings (~#141619)
-      const minLum = pixelIsThinRegular ? 42 : 16;
-      const maxLum = pixelIsThinRegular ? 56 : 34;
-      const clampedLum = Math.max(minLum, Math.min(maxLum, fgLum));
-      const delta = clampedLum - fgLum;
-      fgR += delta;
-      fgG += delta;
-      fgB += delta;
+    if (sat <= 30 && (top.r + top.g + top.b) / 3 < 75) {
+      return {
+        bgHex: rgbToHex(bgR, bgG, bgB),
+        fgHex: "#000000",
+        isThinRegular,
+        isThickBold,
+      };
     }
 
-    const activeRows = rowInkCounts.filter((c) => c > Math.max(4, sw * 0.03));
-    let pixelIsSerif = false;
-    if (activeRows.length >= 5) {
-      const midStart = Math.floor(activeRows.length * 0.3);
-      const midEnd = Math.max(midStart + 1, activeRows.length - 2);
-      const midSlice = activeRows.slice(midStart, midEnd);
-      const midAvg =
-        midSlice.reduce((acc, v) => acc + v, 0) / Math.max(1, midSlice.length);
-      const basePeak = Math.max(...activeRows.slice(-3));
-      if (basePeak / Math.max(1, midAvg) >= 1.48) {
-        pixelIsSerif = true;
-      }
+    const count = Math.max(1, Math.floor(ink.length * 0.25));
+    let sr = 0,
+      sg = 0,
+      sb = 0;
+    for (let i = 0; i < count; i++) {
+      sr += ink[i].r;
+      sg += ink[i].g;
+      sb += ink[i].b;
     }
-
     return {
-      autoBgHex: rgbToHex(bgR, bgG, bgB),
-      autoFgHex: rgbToHex(fgR, fgG, fgB),
-      pixelIsSerif,
-      pixelIsThinRegular,
-      pixelIsThickBold,
+      bgHex: rgbToHex(bgR, bgG, bgB),
+      fgHex: rgbToHex(sr / count, sg / count, sb / count),
+      isThinRegular,
+      isThickBold,
     };
   } catch {
-    return {
-      autoBgHex: "#ffffff",
-      autoFgHex: "#2e3138",
-      pixelIsSerif: false,
-      pixelIsThinRegular: true,
-      pixelIsThickBold: false,
-    };
+    return { bgHex: "#ffffff", fgHex: "#000000", isThinRegular: true, isThickBold: false };
   }
-}
-
-function resolveMaskHex(block: TextBlockItem): string {
-  switch (block.maskBg) {
-    case "transparent":
-      return "transparent";
-    case "auto":
-      return block.autoBgHex || "#ffffff";
-    case "white":
-      return "#ffffff";
-    case "cream":
-      return "#fcfaf0";
-    case "black":
-      return "#0d0d12";
-    case "custom":
-      return block.customMaskHex || "#ffffff";
-    default:
-      return "#ffffff";
-  }
-}
-
-export function isBlockModified(b: TextBlockItem): boolean {
-  return (
-    b.isNew ||
-    b.currentText !== b.originalText ||
-    b.fontSizePt !== b.origFontSizePt ||
-    b.fontFamily !== b.origFontFamily ||
-    b.color !== b.origColor ||
-    b.isBold !== b.origIsBold ||
-    b.isItalic !== b.origIsItalic ||
-    Math.abs(b.xPercent - b.origXPercent) > 0.1 ||
-    Math.abs(b.yPercent - b.origYPercent) > 0.1 ||
-    Math.abs(b.widthPercent - b.origWidthPercent) > 0.1 ||
-    Math.abs(b.heightPercent - b.origHeightPercent) > 0.1
-  );
-}
-
-/**
- * Computes automatic horizontal same-line reflow shifts so that when a word or segment
- * is lengthened/shortened (via click-to-edit or Find & Replace), all subsequent words
- * on that same baseline shift horizontally instead of getting overwritten!
- */
-function computePageReflowMap(
-  pageBlocks: TextBlockItem[],
-  pageWidthPt: number
-): Map<string, { effectiveXPercent: number; needsRedraw: boolean }> {
-  const result = new Map<string, { effectiveXPercent: number; needsRedraw: boolean }>();
-  for (const b of pageBlocks) {
-    result.set(b.id, {
-      effectiveXPercent: b.xPercent,
-      needsRedraw: isBlockModified(b),
-    });
-  }
-
-  if (typeof document === "undefined" || pageWidthPt <= 0) {
-    return result;
-  }
-
-  const mCanvas = document.createElement("canvas");
-  const mCtx = mCanvas.getContext("2d");
-  if (!mCtx) return result;
-
-  // Group single-line non-new blocks by baseline
-  const eligible = pageBlocks.filter(
-    (b) =>
-      !b.isNew &&
-      !b.isWhiteoutOnly &&
-      !b.isMultiline &&
-      Math.abs(b.yPercent - b.origYPercent) <= 0.1 &&
-      Math.abs(b.xPercent - b.origXPercent) <= 0.1
-  );
-
-  const lineGroups: TextBlockItem[][] = [];
-  for (const b of eligible) {
-    const group = lineGroups.find(
-      (g) => Math.abs(g[0].origBaselineYPercent - b.origBaselineYPercent) < 0.42
-    );
-    if (group) {
-      group.push(b);
-    } else {
-      lineGroups.push([b]);
-    }
-  }
-
-  for (const group of lineGroups) {
-    if (group.length <= 1) continue;
-    group.sort((a, b) => a.origXPercent - b.origXPercent);
-
-    let cumShiftPct = 0;
-    for (const b of group) {
-      const modified = isBlockModified(b);
-      const shifted = Math.abs(cumShiftPct) > 0.04;
-      result.set(b.id, {
-        effectiveXPercent: Math.max(0, Math.min(98, b.xPercent + cumShiftPct)),
-        needsRedraw: modified || shifted,
-      });
-
-      if (modified) {
-        const prefix = `${b.isItalic ? "italic " : ""}${b.isBold ? "bold " : ""}`;
-        mCtx.font = `${prefix}100px ${FONT_CSS_MAP[b.fontFamily]}`;
-        const origW100 = mCtx.measureText(b.originalText).width;
-        const currW100 = b.currentText.trim()
-          ? mCtx.measureText(b.currentText).width
-          : 0;
-        const deltaPt = ((currW100 - origW100) / 100) * b.fontSizePt;
-        const deltaPct = (deltaPt / pageWidthPt) * 100;
-        cumShiftPct += deltaPct;
-      }
-    }
-  }
-
-  return result;
-}
-
-function wrapTextIntoLines(
-  ctx: CanvasRenderingContext2D,
-  text: string,
-  maxWidthPx: number,
-  isMultiline?: boolean
-): string[] {
-  if (!isMultiline && !text.includes("\n")) {
-    return [text];
-  }
-  const paragraphs = text.split("\n");
-  const out: string[] = [];
-  for (const para of paragraphs) {
-    const words = para.split(" ");
-    let currentLine = "";
-    for (const w of words) {
-      const candidate = currentLine ? `${currentLine} ${w}` : w;
-      if (currentLine && maxWidthPx > 20 && ctx.measureText(candidate).width > maxWidthPx * 1.03) {
-        out.push(currentLine);
-        currentLine = w;
-      } else {
-        currentLine = candidate;
-      }
-    }
-    out.push(currentLine);
-  }
-  return out.length > 0 ? out : [text];
 }
 
 export default function EditPdfPage() {
   const [file, setFile] = useState<File | null>(null);
+  const [pdfDocProxy, setPdfDocProxy] = useState<any>(null);
   const [totalPages, setTotalPages] = useState<number>(0);
   const [currentPage, setCurrentPage] = useState<number>(1);
-  const [pdfDocProxy, setPdfDocProxy] = useState<any>(null);
 
-  const [selectionGranularity, setSelectionGranularity] =
-    useState<SelectionGranularity>("line");
+  // Active Sejda Tool & Subtools
+  const [activeTool, setActiveTool] = useState<SejdaToolMode>("text");
+  const [formSubTool, setFormSubTool] = useState<FormSubTool>("check");
+  const [annotateSubTool, setAnnotateSubTool] = useState<AnnotateSubTool>("highlight");
+  const [shapeSubTool, setShapeSubTool] = useState<ShapeSubTool>("rect");
+  const [openDropdown, setOpenDropdown] = useState<string | null>(null);
 
-  const [textBlocks, setTextBlocks] = useState<TextBlockItem[]>([]);
-  const [wordTokensByPage, setWordTokensByPage] = useState<
-    Record<number, TextBlockItem[]>
-  >({});
-  const [selectedBlockId, setSelectedBlockId] = useState<string | null>(null);
+  // Live Full-Page Text Lines & Overlays (All Pages)
+  const [lines, setLines] = useState<LiveTextLine[]>([]);
+  const [overlays, setOverlays] = useState<OverlayItem[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
 
-  const [marqueeRect, setMarqueeRect] = useState<{
-    startX: number;
-    startY: number;
-    curX: number;
-    curY: number;
-  } | null>(null);
+  // Undo / Redo History
+  const [historyPast, setHistoryPast] = useState<EditorSnapshot[]>([]);
+  const [historyFuture, setHistoryFuture] = useState<EditorSnapshot[]>([]);
 
-  const [showFindReplace, setShowFindReplace] = useState(false);
-  const [findQuery, setFindQuery] = useState("");
-  const [replaceQuery, setReplaceQuery] = useState("");
-  const [caseSensitiveFind, setCaseSensitiveFind] = useState(false);
+  // Find & Replace Drawer
+  const [showFindReplace, setShowFindReplace] = useState<boolean>(false);
+  const [findText, setFindText] = useState<string>("");
+  const [replaceText, setReplaceText] = useState<string>("");
+  const [matchCase, setMatchCase] = useState<boolean>(false);
 
-  const [historyPast, setHistoryPast] = useState<TextBlockItem[][]>([]);
-  const [historyFuture, setHistoryFuture] = useState<TextBlockItem[][]>([]);
+  // Signature Creation Modal
+  const [showSignModal, setShowSignModal] = useState<boolean>(false);
+  const [signMode, setSignMode] = useState<"draw" | "type">("draw");
+  const [typedSignature, setTypedSignature] = useState<string>("");
+  const [signColor, setSignColor] = useState<string>("#0f172a");
+  const signPadCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const isDrawingSignRef = useRef<boolean>(false);
 
+  // Page Geometry & Zoom
   const [zoomPercent, setZoomPercent] = useState<number>(100);
-  const [previewCleanMode, setPreviewCleanMode] = useState<boolean>(false);
-  const [pageBaseSizePt, setPageBaseSizePt] = useState<{ width: number; height: number }>({
-    width: 595,
-    height: 842,
+  const [pageSizePt, setPageSizePt] = useState<{ width: number; height: number }>({
+    width: 595.28,
+    height: 841.89,
   });
-  const [containerCssWidth, setContainerCssWidth] = useState<number>(595);
-
-  const [isRenderingPage, setIsRenderingPage] = useState(false);
-  const [isSaving, setIsSaving] = useState(false);
+  const [isRenderingPage, setIsRenderingPage] = useState<boolean>(false);
+  const [isApplying, setIsApplying] = useState<boolean>(false);
+  const [readyDownloadBlob, setReadyDownloadBlob] = useState<{
+    bytes: Uint8Array;
+    name: string;
+  } | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [successMessage, setSuccessMessage] = useState<string | null>(null);
 
-  const docDefaultFontRef = useRef<PdfFontFamily>("serif");
+  // Refs for clean background canvases per page
+  const cleanBgCanvasByPageRef = useRef<Record<number, HTMLCanvasElement>>({});
   const extractedPagesRef = useRef<Set<number>>(new Set());
+  const defaultFontIdRef = useRef<EditorFontId>("cambria");
+  const bgCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const pageWrapperRef = useRef<HTMLDivElement | null>(null);
+  const imageInputRef = useRef<HTMLInputElement | null>(null);
 
-  const basePageCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const pageContainerRef = useRef<HTMLDivElement>(null);
-  const pdfCanvasRef = useRef<HTMLCanvasElement>(null);
-
-  const [interactionMode, setInteractionMode] = useState<
-    "none" | "drag" | "resize" | "marquee"
-  >("none");
-  const interactionRef = useRef<{
-    id: string;
-    clientX: number;
-    clientY: number;
-    origX: number;
-    origY: number;
-    origW: number;
-    origH: number;
-    snapshotBeforeDrag: TextBlockItem[];
+  // Drag / Draw interaction state
+  const [dragState, setDragState] = useState<{
+    kind: "move-line" | "move-overlay" | "resize-overlay" | "draw-box" | "freehand";
+    targetId?: string;
+    startClientX: number;
+    startClientY: number;
+    startXPt: number;
+    startYPt: number;
+    startWPt: number;
+    startHPt: number;
+    curXPt: number;
+    curYPt: number;
+    points?: { x: number; y: number }[];
+    snapshotBefore: EditorSnapshot;
   } | null>(null);
 
-  // Load genuine Computer Modern Serif / Sans / Typewriter webfonts for 1:1 LaTeX PDF matching
+  // Load Computer Modern & Google Fonts (Caladea/Carlito/Arimo/Dancing Script) for 1:1 matching
   useEffect(() => {
     if (typeof document === "undefined") return;
-    const linkId = "cm-webfont-stylesheet";
-    if (!document.getElementById(linkId)) {
-      const link = document.createElement("link");
-      link.id = linkId;
-      link.rel = "stylesheet";
-      link.href =
+    if (!document.getElementById("sejda-editor-fonts")) {
+      const link1 = document.createElement("link");
+      link1.id = "sejda-editor-fonts";
+      link1.rel = "stylesheet";
+      link1.href =
         "https://cdn.jsdelivr.net/gh/dreampulse/computer-modern-web-font@master/fonts.css";
-      document.head.appendChild(link);
+      document.head.appendChild(link1);
+
+      const link2 = document.createElement("link");
+      link2.rel = "stylesheet";
+      link2.href =
+        "https://fonts.googleapis.com/css2?family=Arimo:ital,wght@0,400;0,700;1,400;1,700&family=Caladea:ital,wght@0,400;0,700;1,400;1,700&family=Carlito:ital,wght@0,400;0,700;1,400;1,700&family=Dancing+Script:wght@700&family=Tinos:ital,wght@0,400;0,700;1,400;1,700&display=swap";
+      document.head.appendChild(link2);
     }
   }, []);
 
-  useEffect(() => {
-    const el = pdfCanvasRef.current;
-    if (!el || typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver((entries) => {
-      for (const entry of entries) {
-        if (entry.contentRect.width > 0) {
-          setContainerCssWidth(entry.contentRect.width);
-        }
-      }
-    });
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, [file, currentPage, zoomPercent]);
-
-  const pushUndoSnapshot = useCallback((snapshot: TextBlockItem[]) => {
-    setHistoryPast((prev) => [...prev.slice(-39), snapshot]);
-    setHistoryFuture([]);
-  }, []);
+  const pushHistory = useCallback(
+    (snap?: EditorSnapshot) => {
+      const entry = snap || { lines, overlays };
+      setHistoryPast((prev) => [...prev.slice(-39), entry]);
+      setHistoryFuture([]);
+      setReadyDownloadBlob(null);
+    },
+    [lines, overlays]
+  );
 
   const handleUndo = useCallback(() => {
     setHistoryPast((past) => {
       if (past.length === 0) return past;
-      const previous = past[past.length - 1];
-      setHistoryFuture((future) => [textBlocks, ...future.slice(0, 39)]);
-      setTextBlocks(previous);
+      const last = past[past.length - 1];
+      setHistoryFuture((f) => [{ lines, overlays }, ...f.slice(0, 39)]);
+      setLines(last.lines);
+      setOverlays(last.overlays);
+      setReadyDownloadBlob(null);
       return past.slice(0, -1);
     });
-  }, [textBlocks]);
+  }, [lines, overlays]);
 
   const handleRedo = useCallback(() => {
     setHistoryFuture((future) => {
       if (future.length === 0) return future;
-      const nextState = future[0];
-      setHistoryPast((past) => [...prevSlice(past), textBlocks]);
-      setTextBlocks(nextState);
+      const next = future[0];
+      setHistoryPast((p) => [...p.slice(-39), { lines, overlays }]);
+      setLines(next.lines);
+      setOverlays(next.overlays);
+      setReadyDownloadBlob(null);
       return future.slice(1);
     });
-    function prevSlice(arr: TextBlockItem[][]) {
-      return arr.slice(-39);
-    }
-  }, [textBlocks]);
+  }, [lines, overlays]);
 
   /**
-   * Builds blocks at the requested granularity ("word", "line", or "paragraph") from word tokens.
-   * Keeps each token's exact locked `rawFontSizePt` without width-stretching distortion, and
-   * only merges words on a line that share the same fontFamily, weight, and style so inline
-   * monospace/italic words ("nums", "target", "n") keep their exact distinct typography!
+   * Renders a PDF page into TWO offscreen canvases:
+   * 1) `fullCanvas`: Full PDF render (used to sample true ink colors & stem thicknesses)
+   * 2) `cleanBgCanvas`: Text-free background render (`fillText` & `strokeText` suppressed + residual glyph scrubber)
+   *    so that 100% of text on the page can be rendered as live Sejda DOM text lines with zero double-vision!
    */
-  const buildBlocksForGranularity = useCallback(
-    (
-      words: TextBlockItem[],
-      granularity: SelectionGranularity,
-      pageW: number,
-      pageH: number
-    ): TextBlockItem[] => {
-      if (words.length === 0) return [];
-      if (granularity === "word") {
-        return words;
-      }
-
-      const listMarkerRegex = /^\s*(\d+[\.\)]|[a-zA-Z][\.\)]|[•●▪◦\-–—\*])\s*$/;
-      const lines: TextBlockItem[] = [];
-
-      for (const w of words) {
-        const last = lines[lines.length - 1];
-        const sameBaseline =
-          last &&
-          Math.abs(last.origBaselineYPercent - w.origBaselineYPercent) <
-            ((Math.min(last.rawFontSizePt, w.rawFontSizePt) * 0.45) / pageH) * 100;
-        const gapPct = last
-          ? w.origXPercent - (last.origXPercent + last.origWidthPercent)
-          : Infinity;
-        const fontPctW = (Math.max(last?.rawFontSizePt || 10, w.rawFontSizePt) / pageW) * 100;
-        const isLastListMarker = Boolean(last && listMarkerRegex.test(last.originalText));
-
-        if (
-          sameBaseline &&
-          last &&
-          !(isLastListMarker && gapPct > fontPctW * 0.2) &&
-          gapPct >= -fontPctW * 0.4 &&
-          gapPct < fontPctW * 1.8 &&
-          Math.abs(last.rawFontSizePt - w.rawFontSizePt) <= 1.2 &&
-          last.origFontFamily === w.origFontFamily &&
-          last.origIsBold === w.origIsBold &&
-          last.origIsItalic === w.origIsItalic
-        ) {
-          const newRight = Math.max(
-            last.origXPercent + last.origWidthPercent,
-            w.origXPercent + w.origWidthPercent
-          );
-          const newW = newRight - last.origXPercent;
-          const combinedText = `${last.originalText} ${w.originalText}`;
-
-          last.originalText = combinedText;
-          last.currentText = combinedText;
-          last.origWidthPercent = newW;
-          last.widthPercent = newW;
-          last.origHeightPercent = Math.max(last.origHeightPercent, w.origHeightPercent);
-          last.heightPercent = last.origHeightPercent;
-        } else {
-          lines.push({ ...w, id: `line_${w.id}` });
-        }
-      }
-
-      if (granularity === "line") {
-        return lines;
-      }
-
-      const paragraphs: TextBlockItem[] = [];
-      for (const ln of lines) {
-        const lastP = paragraphs[paragraphs.length - 1];
-        const lineHeightPct = (ln.rawFontSizePt / pageH) * 100;
-        const verticalStepPct = lastP
-          ? ln.origBaselineYPercent -
-            (lastP.origYPercent + lastP.origHeightPercent - lineHeightPct * 0.25)
-          : Infinity;
-        const sameIndent = lastP && Math.abs(lastP.origXPercent - ln.origXPercent) < 3.5;
-        const sameFont =
-          lastP &&
-          lastP.origFontFamily === ln.origFontFamily &&
-          Math.abs(lastP.rawFontSizePt - ln.rawFontSizePt) <= 1.2 &&
-          lastP.origIsBold === ln.origIsBold &&
-          lastP.origIsItalic === ln.origIsItalic;
-
-        if (
-          lastP &&
-          sameIndent &&
-          sameFont &&
-          verticalStepPct > 0 &&
-          verticalStepPct < lineHeightPct * 1.85 &&
-          !listMarkerRegex.test(ln.originalText)
-        ) {
-          const newRight = Math.max(
-            lastP.origXPercent + lastP.origWidthPercent,
-            ln.origXPercent + ln.origWidthPercent
-          );
-          const newBottom = Math.max(
-            lastP.origYPercent + lastP.origHeightPercent,
-            ln.origYPercent + ln.origHeightPercent
-          );
-          lastP.originalText = `${lastP.originalText}\n${ln.originalText}`;
-          lastP.currentText = lastP.originalText;
-          lastP.isMultiline = true;
-          lastP.lineHeightPt = Math.round(ln.rawFontSizePt * 1.32 * 10) / 10;
-          lastP.origWidthPercent = newRight - lastP.origXPercent;
-          lastP.widthPercent = lastP.origWidthPercent;
-          lastP.origHeightPercent = newBottom - lastP.origYPercent;
-          lastP.heightPercent = lastP.origHeightPercent;
-        } else {
-          paragraphs.push({
-            ...ln,
-            id: `para_${ln.id}`,
-            lineHeightPt: Math.round(ln.rawFontSizePt * 1.32 * 10) / 10,
-          });
-        }
-      }
-
-      return paragraphs;
-    },
-    []
-  );
-
-  const extractWordTokensFromPage = useCallback(
-    async (
-      pdf: any,
-      pageNum: number,
-      canvasCtx?: CanvasRenderingContext2D | null,
-      canvasW?: number,
-      canvasH?: number,
-      renderScale: number = RENDER_SCALE
-    ): Promise<TextBlockItem[]> => {
+  const extractAndRenderPage = useCallback(
+    async (pdf: any, pageNum: number) => {
       const page = await pdf.getPage(pageNum);
-      const baseViewport = page.getViewport({ scale: 1.0 });
-      const pageW = baseViewport.width;
-      const pageH = baseViewport.height;
-      const vpTransform: number[] = baseViewport.transform || [1, 0, 0, -1, 0, pageH];
+      const baseVp = page.getViewport({ scale: 1.0 });
+      const pageW = baseVp.width;
+      const pageH = baseVp.height;
+      const vpTransform: number[] = baseVp.transform || [1, 0, 0, -1, 0, pageH];
 
+      const renderVp = page.getViewport({ scale: BG_RENDER_SCALE });
+      const cw = Math.ceil(renderVp.width);
+      const ch = Math.ceil(renderVp.height);
+
+      // 1. Render full page (for accurate color/stroke sampling)
+      const fullCanvas = document.createElement("canvas");
+      fullCanvas.width = cw;
+      fullCanvas.height = ch;
+      const fullCtx = fullCanvas.getContext("2d")!;
+      await page.render({ canvasContext: fullCtx, viewport: renderVp }).promise;
+
+      // 2. Render text-free background canvas (suppressing fillText and strokeText)
+      const cleanCanvas = document.createElement("canvas");
+      cleanCanvas.width = cw;
+      cleanCanvas.height = ch;
+      const cleanCtx = cleanCanvas.getContext("2d")!;
+      cleanCtx.fillText = () => {};
+      cleanCtx.strokeText = () => {};
+      await page.render({ canvasContext: cleanCtx, viewport: renderVp }).promise;
+
+      // 3. Extract text items & merge into Sejda-style horizontal text lines
       const textContent = await page.getTextContent();
       const rawItems: any[] = textContent.items || [];
       const stylesDict: Record<string, any> = textContent.styles || {};
 
-      const measureCanvas =
-        typeof document !== "undefined" ? document.createElement("canvas") : null;
-      const measureCtx = measureCanvas ? measureCanvas.getContext("2d") : null;
-
-      interface WordFrag {
-        text: string;
-        x: number;
-        yTop: number;
-        baselineY: number;
-        w: number;
-        h: number;
-        rawFontSize: number;
-        fontFamily: PdfFontFamily;
+      interface RawSegment {
+        str: string;
+        xPt: number;
+        yTopPt: number;
+        baselineYPt: number;
+        wPt: number;
+        hPt: number;
+        fontSizePt: number;
+        fontId: EditorFontId;
         isBold: boolean;
         isItalic: boolean;
       }
 
-      const wordFrags: WordFrag[] = [];
+      const segments: RawSegment[] = [];
 
       for (const item of rawItems) {
         if (!item.str || !item.str.trim()) continue;
-
-        const m = multiplyTransform(vpTransform, item.transform);
+        const m = multiplyMatrix(vpTransform, item.transform);
         const vx = m[4];
-        const vBaselineY = m[5];
-        const rawFontSize = Math.max(
+        const vBaseY = m[5];
+        const fontSizePt = Math.max(
           6.5,
           Math.round((Math.hypot(m[2], m[3]) || Math.hypot(m[0], m[1])) * 10) / 10
         );
-
-        const itemW = item.width || item.str.length * (rawFontSize * 0.5);
-        const itemH = Math.max(rawFontSize * 1.08, item.height || rawFontSize * 1.08);
-        const yTop = vBaselineY - rawFontSize * 0.82;
+        const wPt = Math.max(fontSizePt * 0.35, item.width || item.str.length * fontSizePt * 0.5);
+        const hPt = Math.max(fontSizePt * 1.15, item.height || fontSizePt * 1.15);
+        const yTopPt = vBaseY - fontSizePt * 0.84;
 
         const styleObj = stylesDict[item.fontName] || {};
         let fObj: any = null;
@@ -870,1948 +635,2042 @@ export default function EditPdfPage() {
           // Ignore
         }
 
-        const { fontFamily, isBold, isItalic } = classifyPdfFontMetadata(
+        const { fontId, isBold, isItalic } = classifyFontItem(
           realFontName,
           styleObj.fontFamily || "",
           item.transform[2],
-          rawFontSize,
-          docDefaultFontRef.current,
+          fontSizePt,
+          defaultFontIdRef.current,
           fObj
         );
 
-        const rawStr: string = item.str;
-        const tokenMatches = Array.from(rawStr.matchAll(/\S+/g));
-
-        if (tokenMatches.length <= 1) {
-          wordFrags.push({
-            text: rawStr.trim(),
-            x: vx,
-            yTop,
-            baselineY: vBaselineY,
-            w: Math.max(itemW, rawFontSize * 0.35),
-            h: itemH,
-            rawFontSize,
-            fontFamily,
-            isBold,
-            isItalic,
-          });
-        } else {
-          // Use proportional glyph measurement instead of naive character count so word X/W are exact
-          let fullMeasuredW = 0;
-          if (measureCtx) {
-            const prefix = `${isItalic ? "italic " : ""}${isBold ? "bold " : ""}`;
-            measureCtx.font = `${prefix}100px ${FONT_CSS_MAP[fontFamily]}`;
-            fullMeasuredW = measureCtx.measureText(rawStr).width;
-          }
-          const totalChars = Math.max(1, rawStr.length);
-
-          for (const match of tokenMatches) {
-            const wordStr = match[0];
-            const startChar = match.index || 0;
-            let wordX = vx + (startChar / totalChars) * itemW;
-            let wordW = Math.max(rawFontSize * 0.35, (wordStr.length / totalChars) * itemW);
-
-            if (measureCtx && fullMeasuredW > 0) {
-              const prefixW = measureCtx.measureText(rawStr.slice(0, startChar)).width;
-              const tokenW = measureCtx.measureText(wordStr).width;
-              wordX = vx + (prefixW / fullMeasuredW) * itemW;
-              wordW = Math.max(rawFontSize * 0.35, (tokenW / fullMeasuredW) * itemW);
-            }
-
-            wordFrags.push({
-              text: wordStr,
-              x: wordX,
-              yTop,
-              baselineY: vBaselineY,
-              w: wordW,
-              h: itemH,
-              rawFontSize,
-              fontFamily,
-              isBold,
-              isItalic,
-            });
-          }
-        }
+        segments.push({
+          str: item.str,
+          xPt: vx,
+          yTopPt,
+          baselineYPt: vBaseY,
+          wPt,
+          hPt,
+          fontSizePt,
+          fontId,
+          isBold,
+          isItalic,
+        });
       }
 
-      wordFrags.sort((a, b) => {
-        if (Math.abs(a.yTop - b.yTop) > Math.min(a.rawFontSize, b.rawFontSize) * 0.42) {
-          return a.yTop - b.yTop;
+      // Sort top-to-bottom, then left-to-right
+      segments.sort((a, b) => {
+        if (Math.abs(a.baselineYPt - b.baselineYPt) > Math.min(a.fontSizePt, b.fontSizePt) * 0.45) {
+          return a.baselineYPt - b.baselineYPt;
         }
-        return a.x - b.x;
+        return a.xPt - b.xPt;
       });
 
-      // Re-join split accents/apostrophes (e.g. "É" + "tant" -> "Étant", "d'" + "entiers" -> "d'entiers")
-      const cleanWords: WordFrag[] = [];
-      for (const wf of wordFrags) {
-        const prev = cleanWords[cleanWords.length - 1];
+      // Group segments on the same baseline with matching typography into Sejda horizontal lines
+      const mergedLines: RawSegment[] = [];
+      for (const seg of segments) {
+        const prev = mergedLines[mergedLines.length - 1];
         const sameBase =
           prev &&
-          Math.abs(prev.baselineY - wf.baselineY) <
-            Math.min(prev.rawFontSize, wf.rawFontSize) * 0.4;
-        const gap = prev ? wf.x - (prev.x + prev.w) : Infinity;
-        const endsWithApostrophe = Boolean(prev && /['’ʼ`-]$/.test(prev.text));
-        const maxJoinGap = endsWithApostrophe
-          ? wf.rawFontSize * 0.26
-          : wf.rawFontSize * 0.13;
+          Math.abs(prev.baselineYPt - seg.baselineYPt) <
+            Math.min(prev.fontSizePt, seg.fontSizePt) * 0.45;
+        const gapPt = prev ? seg.xPt - (prev.xPt + prev.wPt) : Infinity;
+        const maxGapPt = Math.max(prev?.fontSizePt || 10, seg.fontSizePt) * 2.5;
 
         if (
           sameBase &&
           prev &&
-          gap >= -wf.rawFontSize * 0.35 &&
-          gap <= maxJoinGap &&
-          prev.fontFamily === wf.fontFamily &&
-          prev.isBold === wf.isBold &&
-          prev.isItalic === wf.isItalic
+          gapPt >= -seg.fontSizePt * 0.5 &&
+          gapPt <= maxGapPt &&
+          Math.abs(prev.fontSizePt - seg.fontSizePt) <= 1.0 &&
+          prev.isBold === seg.isBold &&
+          prev.isItalic === seg.isItalic &&
+          prev.fontId === seg.fontId
         ) {
-          prev.text += wf.text;
-          prev.w = Math.max(prev.w, wf.x + wf.w - prev.x);
-          prev.h = Math.max(prev.h, wf.h);
+          const needsSpace =
+            gapPt > seg.fontSizePt * 0.14 &&
+            !prev.str.endsWith(" ") &&
+            !seg.str.startsWith(" ") &&
+            !/['’ʼ`-]$/.test(prev.str);
+          prev.str = `${prev.str}${needsSpace ? " " : ""}${seg.str}`;
+          prev.wPt = Math.max(prev.wPt, seg.xPt + seg.wPt - prev.xPt);
+          prev.hPt = Math.max(prev.hPt, seg.hPt);
         } else {
-          cleanWords.push({ ...wf });
+          mergedLines.push({ ...seg });
         }
       }
 
-      return cleanWords.map((wd, idx) => {
-        let autoBgHex = "#ffffff";
-        let autoFgHex = "#2e3138";
-        let finalFontFamily: PdfFontFamily = wd.fontFamily;
-        let finalIsBold: boolean = wd.isBold;
+      const builtLines: LiveTextLine[] = mergedLines.map((ln, idx) => {
+        const sampled = sampleBoxFromFullCanvas(
+          fullCtx,
+          cw,
+          ch,
+          ln.xPt * BG_RENDER_SCALE,
+          ln.yTopPt * BG_RENDER_SCALE,
+          ln.wPt * BG_RENDER_SCALE,
+          ln.hPt * BG_RENDER_SCALE,
+          ln.fontSizePt * BG_RENDER_SCALE
+        );
 
-        if (canvasCtx && canvasW && canvasH) {
-          const sampled = sampleCanvasStyleForBox(
-            canvasCtx,
-            canvasW,
-            canvasH,
-            wd.x * renderScale,
-            wd.yTop * renderScale,
-            wd.w * renderScale,
-            wd.h * renderScale,
-            wd.rawFontSize * renderScale
-          );
-          autoBgHex = sampled.autoBgHex;
-          autoFgHex = sampled.autoFgHex;
-          if (sampled.pixelIsSerif && finalFontFamily !== "mono") {
-            finalFontFamily = "serif";
-          }
-          // Guard: if the rendered PDF glyphs have 1px thin stems, force Regular (never Bold!)
-          if (sampled.pixelIsThinRegular) {
-            finalIsBold = false;
-          } else if (sampled.pixelIsThickBold) {
-            finalIsBold = true;
-          }
+        // Scrub any residual path-drawn Type1/Type3 glyph pixels from cleanCanvas inside this text box
+        cleanCtx.fillStyle = sampled.bgHex;
+        cleanCtx.fillRect(
+          Math.max(0, ln.xPt * BG_RENDER_SCALE - 1.5),
+          Math.max(0, ln.yTopPt * BG_RENDER_SCALE - 1.5),
+          ln.wPt * BG_RENDER_SCALE + 3,
+          ln.hPt * BG_RENDER_SCALE + 3
+        );
+
+        let finalBold = ln.isBold;
+        if (sampled.isThinRegular) {
+          finalBold = false;
+        } else if (sampled.isThickBold) {
+          finalBold = true;
         }
 
-        const xPct = Math.max(0, Math.min(98, (wd.x / pageW) * 100));
-        const yPct = Math.max(0, Math.min(98, (wd.yTop / pageH) * 100));
-        const baseYPct = Math.max(0, Math.min(99, (wd.baselineY / pageH) * 100));
-        const wPct = Math.max(0.6, Math.min(100 - xPct, ((wd.w + 0.6) / pageW) * 100));
-        const hPct = Math.max(1.3, ((wd.h + 1.2) / pageH) * 100);
-
         return {
-          id: `p${pageNum}_w_${idx}`,
+          id: `p${pageNum}_line_${idx}`,
           pageNumber: pageNum,
-          originalText: wd.text,
-          currentText: wd.text,
+          originalText: ln.str,
+          text: ln.str,
           isNew: false,
-          rawFontSizePt: wd.rawFontSize,
-          origXPercent: xPct,
-          origYPercent: yPct,
-          origBaselineYPercent: baseYPct,
-          origWidthPercent: wPct,
-          origHeightPercent: hPct,
-          xPercent: xPct,
-          yPercent: yPct,
-          widthPercent: wPct,
-          heightPercent: hPct,
-          origFontSizePt: wd.rawFontSize,
-          origFontFamily: finalFontFamily,
-          origColor: autoFgHex,
-          origIsBold: finalIsBold,
-          origIsItalic: wd.isItalic,
-          fontSizePt: wd.rawFontSize,
-          fontFamily: finalFontFamily,
-          color: autoFgHex,
-          isBold: finalIsBold,
-          isItalic: wd.isItalic,
-          textAlign: "left",
-          maskBg: "auto",
-          autoBgHex,
-          customMaskHex: autoBgHex,
+          origXPt: ln.xPt,
+          origYPt: ln.yTopPt,
+          origBaselineYPt: ln.baselineYPt,
+          origWidthPt: ln.wPt,
+          origHeightPt: ln.hPt,
+          xPt: ln.xPt,
+          yPt: ln.yTopPt,
+          widthPt: ln.wPt,
+          heightPt: ln.hPt,
+          fontSizePt: ln.fontSizePt,
+          fontId: ln.fontId,
+          color: sampled.fgHex,
+          isBold: finalBold,
+          isItalic: ln.isItalic,
+          bgHex: sampled.bgHex,
         };
       });
+
+      cleanBgCanvasByPageRef.current[pageNum] = cleanCanvas;
+      return { pageW, pageH, cleanCanvas, builtLines };
     },
     []
   );
-
-  useEffect(() => {
-    const pageWords = wordTokensByPage[currentPage];
-    if (!pageWords || pageWords.length === 0) return;
-
-    setTextBlocks((prev) => {
-      const otherPages = prev.filter((b) => b.pageNumber !== currentPage);
-      const modifiedOnCurrent = prev.filter(
-        (b) => b.pageNumber === currentPage && isBlockModified(b)
-      );
-
-      const uncoveredWords = pageWords.filter((w) => {
-        const wxCenter = w.origXPercent + w.origWidthPercent / 2;
-        const wyCenter = w.origYPercent + w.origHeightPercent / 2;
-        return !modifiedOnCurrent.some(
-          (m) =>
-            wxCenter >= m.origXPercent - 0.4 &&
-            wxCenter <= m.origXPercent + m.origWidthPercent + 0.4 &&
-            wyCenter >= m.origYPercent - 0.4 &&
-            wyCenter <= m.origYPercent + m.origHeightPercent + 0.4
-        );
-      });
-
-      const rebuilt = buildBlocksForGranularity(
-        uncoveredWords,
-        selectionGranularity,
-        pageBaseSizePt.width,
-        pageBaseSizePt.height
-      );
-      return [...otherPages, ...modifiedOnCurrent, ...rebuilt];
-    });
-  }, [
-    selectionGranularity,
-    currentPage,
-    wordTokensByPage,
-    pageBaseSizePt.width,
-    pageBaseSizePt.height,
-    buildBlocksForGranularity,
-  ]);
 
   const handleFileSelected = async (files: File[]) => {
     const selected = files[0];
     if (!selected) return;
 
-    setErrorMessage(null);
-    setSuccessMessage(null);
     setFile(selected);
     setCurrentPage(1);
-    setTextBlocks([]);
-    setWordTokensByPage({});
+    setLines([]);
+    setOverlays([]);
+    setSelectedId(null);
     setHistoryPast([]);
     setHistoryFuture([]);
-    setSelectedBlockId(null);
+    setReadyDownloadBlob(null);
+    setErrorMessage(null);
+    cleanBgCanvasByPageRef.current = {};
     extractedPagesRef.current = new Set();
 
     try {
       const pdfjs = await loadPdfJs();
       const buffer = await selected.arrayBuffer();
-      docDefaultFontRef.current = detectDocumentDefaultFontFromBytes(buffer);
+      defaultFontIdRef.current = detectDefaultFontFromPdfBuffer(buffer);
 
       const pdf = await pdfjs.getDocument({ data: buffer }).promise;
       setPdfDocProxy(pdf);
       setTotalPages(pdf.numPages);
-
-      if (pdf.numPages > 1) {
-        (async () => {
-          for (let p = 2; p <= Math.min(pdf.numPages, 40); p++) {
-            if (extractedPagesRef.current.has(p)) continue;
-            extractedPagesRef.current.add(p);
-            try {
-              const pg = await pdf.getPage(p);
-              const vp = pg.getViewport({ scale: 1.0 });
-              const pWords = await extractWordTokensFromPage(pdf, p);
-              const pLines = buildBlocksForGranularity(
-                pWords,
-                selectionGranularity,
-                vp.width,
-                vp.height
-              );
-              setWordTokensByPage((old) => ({ ...old, [p]: pWords }));
-              setTextBlocks((prev) => {
-                if (prev.some((b) => b.pageNumber === p)) return prev;
-                return [...prev, ...pLines];
-              });
-            } catch {
-              // Ignore single-page error
-            }
-          }
-        })();
-      }
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : "Failed to load PDF document.";
-      setErrorMessage(msg);
+      setErrorMessage(err instanceof Error ? err.message : "Failed to load PDF file.");
       setFile(null);
     }
   };
 
-  const currentPageBlocks = useMemo(
-    () => textBlocks.filter((b) => b.pageNumber === currentPage),
-    [textBlocks, currentPage]
-  );
+  useEffect(() => {
+    if (!pdfDocProxy) return;
+    let cancelled = false;
 
-  const pageReflowMap = useMemo(
-    () => computePageReflowMap(currentPageBlocks, pageBaseSizePt.width),
-    [currentPageBlocks, pageBaseSizePt.width]
-  );
-
-  /**
-   * Two-Pass Canvas Rendering:
-   * Pass 1 paints all background masks (for modified blocks and same-line shifted blocks)
-   * Pass 2 paints all foreground text at its exact shifted `effectiveXPercent` and baseline
-   * so neighboring words NEVER get overwritten or clipped!
-   */
-  const repaintVisibleCanvas = useCallback(() => {
-    const visibleCanvas = pdfCanvasRef.current;
-    const baseCanvas = basePageCanvasRef.current;
-    if (!visibleCanvas || !baseCanvas) return;
-
-    const ctx = visibleCanvas.getContext("2d");
-    if (!ctx) return;
-
-    const cw = baseCanvas.width;
-    const ch = baseCanvas.height;
-    if (visibleCanvas.width !== cw || visibleCanvas.height !== ch) {
-      visibleCanvas.width = cw;
-      visibleCanvas.height = ch;
-    }
-
-    ctx.clearRect(0, 0, cw, ch);
-    ctx.drawImage(baseCanvas, 0, 0);
-
-    // PASS 1: Paint paper background masks over original positions and shifted boxes
-    for (const block of currentPageBlocks) {
-      const reflow = pageReflowMap.get(block.id);
-      const needsRedraw = reflow?.needsRedraw || false;
-      const effectiveXPct = reflow?.effectiveXPercent ?? block.xPercent;
-      const isSelected = !previewCleanMode && selectedBlockId === block.id;
-      if (!needsRedraw && !isSelected) continue;
-
-      const maskHex = resolveMaskHex(block);
-
-      if (!block.isNew && maskHex !== "transparent") {
-        const ox = (block.origXPercent / 100) * cw;
-        const oy = (block.origYPercent / 100) * ch;
-        const ow = (block.origWidthPercent / 100) * cw;
-        const oh = (block.origHeightPercent / 100) * ch;
-        ctx.fillStyle = maskHex;
-        ctx.fillRect(Math.max(0, ox - 1), Math.max(0, oy - 0.8), ow + 2, oh + 1.6);
-      }
-
-      const bx = (effectiveXPct / 100) * cw;
-      const by = (block.yPercent / 100) * ch;
-      const bw = (block.widthPercent / 100) * cw;
-      const bh = (block.heightPercent / 100) * ch;
-
-      if (block.isWhiteoutOnly) {
-        ctx.fillStyle = maskHex === "transparent" ? "#ffffff" : maskHex;
-        ctx.fillRect(bx, by, bw, bh);
-        continue;
-      }
-
-      if (needsRedraw && !isSelected && block.currentText.trim() && maskHex !== "transparent") {
-        const fontPx = Math.max(6.5, block.fontSizePt) * RENDER_SCALE;
-        const fontPrefix = `${block.isItalic ? "italic " : ""}${block.isBold ? "bold " : ""}`;
-        ctx.font = `${fontPrefix}${fontPx}px ${FONT_CSS_MAP[block.fontFamily]}`;
-
-        const wrappedLines = wrapTextIntoLines(
-          ctx,
-          block.currentText,
-          bw,
-          block.isMultiline
-        );
-        const lineStepPx = (block.lineHeightPt || block.fontSizePt * 1.3) * RENDER_SCALE;
-        const maxLineW = Math.max(
-          bw,
-          ...wrappedLines.map((l) => ctx.measureText(l).width + 2)
-        );
-        const totalH =
-          wrappedLines.length > 1
-            ? (wrappedLines.length - 1) * lineStepPx + fontPx * 1.15
-            : Math.max(bh, fontPx * 1.08);
-
-        ctx.fillStyle = maskHex;
-        ctx.fillRect(Math.max(0, bx - 0.8), Math.max(0, by - 0.5), maxLineW + 1.6, totalH + 1);
-      }
-    }
-
-    // PASS 2: Paint foreground replacement/reflowed text cleanly on top of all masks
-    for (const block of currentPageBlocks) {
-      if (block.isWhiteoutOnly) continue;
-      const reflow = pageReflowMap.get(block.id);
-      const needsRedraw = reflow?.needsRedraw || false;
-      const effectiveXPct = reflow?.effectiveXPercent ?? block.xPercent;
-      const isSelected = !previewCleanMode && selectedBlockId === block.id;
-
-      if (!needsRedraw || isSelected || !block.currentText.trim()) continue;
-
-      const bx = (effectiveXPct / 100) * cw;
-      const by = (block.yPercent / 100) * ch;
-      const bw = (block.widthPercent / 100) * cw;
-
-      const fontPx = Math.max(6.5, block.fontSizePt) * RENDER_SCALE;
-      const fontPrefix = `${block.isItalic ? "italic " : ""}${block.isBold ? "bold " : ""}`;
-      ctx.font = `${fontPrefix}${fontPx}px ${FONT_CSS_MAP[block.fontFamily]}`;
-
-      const wrappedLines = wrapTextIntoLines(
-        ctx,
-        block.currentText,
-        bw,
-        block.isMultiline
-      );
-      const lineStepPx = (block.lineHeightPt || block.fontSizePt * 1.3) * RENDER_SCALE;
-      const maxLineW = Math.max(
-        bw,
-        ...wrappedLines.map((l) => ctx.measureText(l).width + 2)
-      );
-
-      const isRTL = /[\u0600-\u06FF]/.test(block.currentText);
-      ctx.direction = isRTL ? "rtl" : "ltr";
-      ctx.fillStyle = block.color;
-      ctx.textBaseline = "alphabetic";
-
-      const movedVertically = Math.abs(block.yPercent - block.origYPercent) > 0.1;
-      const firstBaselineY = movedVertically
-        ? by + fontPx * 0.82
-        : (block.origBaselineYPercent / 100) * ch;
-
-      wrappedLines.forEach((lineText, idx) => {
-        const lineBaseY = firstBaselineY + idx * lineStepPx;
-        if (isRTL || block.textAlign === "right") {
-          ctx.textAlign = "right";
-          ctx.fillText(lineText, bx + maxLineW - 1, lineBaseY);
-        } else if (block.textAlign === "center") {
-          ctx.textAlign = "center";
-          ctx.fillText(lineText, bx + maxLineW / 2, lineBaseY);
-        } else {
-          ctx.textAlign = "left";
-          ctx.fillText(lineText, bx, lineBaseY);
-        }
-      });
-    }
-  }, [currentPageBlocks, pageReflowMap, selectedBlockId, previewCleanMode]);
-
-  const renderAndExtractPage = useCallback(
-    async (pageNum: number) => {
-      if (!pdfDocProxy || !pdfCanvasRef.current) return;
-
+    (async () => {
       setIsRenderingPage(true);
       try {
-        if (typeof document !== "undefined" && (document as any).fonts?.ready) {
-          await (document as any).fonts.ready.catch(() => {});
+        const page = await pdfDocProxy.getPage(currentPage);
+        const vp = page.getViewport({ scale: 1.0 });
+        if (!cancelled) {
+          setPageSizePt({ width: vp.width, height: vp.height });
         }
 
-        const page = await pdfDocProxy.getPage(pageNum);
-        const baseViewport = page.getViewport({ scale: 1.0 });
-        setPageBaseSizePt({
-          width: baseViewport.width,
-          height: baseViewport.height,
-        });
-
-        const viewport = page.getViewport({ scale: RENDER_SCALE });
-        const offscreen = document.createElement("canvas");
-        offscreen.width = Math.ceil(viewport.width);
-        offscreen.height = Math.ceil(viewport.height);
-        const offCtx = offscreen.getContext("2d");
-        if (!offCtx) return;
-
-        await page.render({ canvasContext: offCtx, viewport }).promise;
-        basePageCanvasRef.current = offscreen;
-
-        if (pdfCanvasRef.current) {
-          pdfCanvasRef.current.width = offscreen.width;
-          pdfCanvasRef.current.height = offscreen.height;
-          const vCtx = pdfCanvasRef.current.getContext("2d");
-          vCtx?.drawImage(offscreen, 0, 0);
-          if (pdfCanvasRef.current.clientWidth > 0) {
-            setContainerCssWidth(pdfCanvasRef.current.clientWidth);
-          }
-        }
-
-        const pageWords = await extractWordTokensFromPage(
-          pdfDocProxy,
-          pageNum,
-          offCtx,
-          offscreen.width,
-          offscreen.height,
-          RENDER_SCALE
-        );
-        extractedPagesRef.current.add(pageNum);
-        setWordTokensByPage((old) => ({ ...old, [pageNum]: pageWords }));
-
-        const builtBlocks = buildBlocksForGranularity(
-          pageWords,
-          selectionGranularity,
-          baseViewport.width,
-          baseViewport.height
-        );
-
-        setTextBlocks((old) => {
-          const modifiedOnPage = old.filter(
-            (b) => b.pageNumber === pageNum && isBlockModified(b)
+        if (!extractedPagesRef.current.has(currentPage)) {
+          extractedPagesRef.current.add(currentPage);
+          const { cleanCanvas, builtLines } = await extractAndRenderPage(
+            pdfDocProxy,
+            currentPage
           );
-          if (modifiedOnPage.length > 0) {
-            return old;
+          if (!cancelled) {
+            setLines((prev) => [
+              ...prev.filter((l) => l.pageNumber !== currentPage),
+              ...builtLines,
+            ]);
+            if (bgCanvasRef.current) {
+              bgCanvasRef.current.width = cleanCanvas.width;
+              bgCanvasRef.current.height = cleanCanvas.height;
+              bgCanvasRef.current.getContext("2d")?.drawImage(cleanCanvas, 0, 0);
+            }
           }
-          return [...old.filter((b) => b.pageNumber !== pageNum), ...builtBlocks];
-        });
+        } else {
+          const cached = cleanBgCanvasByPageRef.current[currentPage];
+          if (cached && bgCanvasRef.current && !cancelled) {
+            bgCanvasRef.current.width = cached.width;
+            bgCanvasRef.current.height = cached.height;
+            bgCanvasRef.current.getContext("2d")?.drawImage(cached, 0, 0);
+          }
+        }
       } catch (err) {
-        console.error("Failed to render/extract PDF page:", err);
+        console.error("Error rendering page:", err);
       } finally {
-        setIsRenderingPage(false);
+        if (!cancelled) setIsRenderingPage(false);
       }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [pdfDocProxy, currentPage, extractAndRenderPage]);
+
+  // Update Line helper
+  const updateLine = useCallback(
+    (id: string, patch: Partial<LiveTextLine>, recordUndo: boolean = true) => {
+      setLines((prev) => {
+        if (recordUndo) {
+          pushHistory({ lines: prev, overlays });
+        }
+        return prev.map((l) => (l.id === id ? { ...l, ...patch } : l));
+      });
     },
-    [pdfDocProxy, extractWordTokensFromPage, buildBlocksForGranularity, selectionGranularity]
+    [overlays, pushHistory]
   );
 
-  useEffect(() => {
-    if (pdfDocProxy) {
-      renderAndExtractPage(currentPage);
-    }
-  }, [pdfDocProxy, currentPage, renderAndExtractPage]);
+  // Update Overlay helper
+  const updateOverlay = useCallback(
+    (id: string, patch: Partial<OverlayItem>, recordUndo: boolean = true) => {
+      setOverlays((prev) => {
+        if (recordUndo) {
+          pushHistory({ lines, overlays: prev });
+        }
+        return prev.map((o) => (o.id === id ? { ...o, ...patch } : o));
+      });
+    },
+    [lines, pushHistory]
+  );
 
-  useEffect(() => {
-    if (!isRenderingPage && basePageCanvasRef.current) {
-      repaintVisibleCanvas();
-    }
-  }, [isRenderingPage, repaintVisibleCanvas]);
-
-  const handleSelectBlock = useCallback((block: TextBlockItem | null) => {
-    if (!block) {
-      setSelectedBlockId(null);
+  // Duplicate Line or Overlay (Sejda Duplicate button)
+  const handleDuplicateSelected = () => {
+    if (!selectedId) return;
+    const ln = lines.find((l) => l.id === selectedId);
+    if (ln) {
+      pushHistory();
+      const copyId = `line_copy_${Date.now()}`;
+      const copyLine: LiveTextLine = {
+        ...ln,
+        id: copyId,
+        isNew: true,
+        xPt: Math.min(pageSizePt.width - 40, ln.xPt + 12),
+        yPt: Math.min(pageSizePt.height - 20, ln.yPt + 16),
+      };
+      setLines((prev) => [...prev, copyLine]);
+      setSelectedId(copyId);
       return;
     }
-    setSelectedBlockId(block.id);
-    if (!block.isWhiteoutOnly && block.currentText) {
-      setFindQuery(block.currentText);
-      setReplaceQuery(block.currentText);
+    const ov = overlays.find((o) => o.id === selectedId);
+    if (ov) {
+      pushHistory();
+      const copyId = `ov_copy_${Date.now()}`;
+      const copyOv: OverlayItem = {
+        ...ov,
+        id: copyId,
+        xPt: Math.min(pageSizePt.width - 30, ov.xPt + 14),
+        yPt: Math.min(pageSizePt.height - 30, ov.yPt + 14),
+      };
+      setOverlays((prev) => [...prev, copyOv]);
+      setSelectedId(copyId);
     }
-  }, []);
-
-  const handleNavigateLine = useCallback(
-    (direction: "up" | "down") => {
-      if (!selectedBlockId) return;
-      const pageBlocks = textBlocks
-        .filter((b) => b.pageNumber === currentPage && !b.isWhiteoutOnly)
-        .sort((a, b) => a.yPercent - b.yPercent || a.xPercent - b.xPercent);
-      const idx = pageBlocks.findIndex((b) => b.id === selectedBlockId);
-      if (idx === -1) return;
-      const targetIdx = direction === "down" ? idx + 1 : idx - 1;
-      if (targetIdx >= 0 && targetIdx < pageBlocks.length) {
-        handleSelectBlock(pageBlocks[targetIdx]);
-      }
-    },
-    [selectedBlockId, textBlocks, currentPage, handleSelectBlock]
-  );
-
-  const handleViewportPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (previewCleanMode || !pdfCanvasRef.current) return;
-    if (e.button !== 0) return;
-
-    const rect = pdfCanvasRef.current.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0) return;
-
-    const xPct = ((e.clientX - rect.left) / rect.width) * 100;
-    const yPct = ((e.clientY - rect.top) / rect.height) * 100;
-    if (xPct < 0 || xPct > 100 || yPct < 0 || yPct > 100) return;
-
-    setInteractionMode("marquee");
-    setMarqueeRect({ startX: xPct, startY: yPct, curX: xPct, curY: yPct });
   };
 
-  useEffect(() => {
-    if (interactionMode !== "marquee") return;
+  // Delete Line or Overlay (Sejda Trash button)
+  const handleDeleteSelected = useCallback(() => {
+    if (!selectedId) return;
+    pushHistory();
+    setLines((prev) => prev.filter((l) => l.id !== selectedId));
+    setOverlays((prev) => prev.filter((o) => o.id !== selectedId));
+    setSelectedId(null);
+  }, [selectedId, pushHistory]);
 
-    const handleMove = (e: PointerEvent) => {
-      if (!pdfCanvasRef.current) return;
-      const rect = pdfCanvasRef.current.getBoundingClientRect();
-      if (rect.width <= 0 || rect.height <= 0) return;
-      const curX = Math.max(0, Math.min(100, ((e.clientX - rect.left) / rect.width) * 100));
-      const curY = Math.max(0, Math.min(100, ((e.clientY - rect.top) / rect.height) * 100));
-      setMarqueeRect((prev) => (prev ? { ...prev, curX, curY } : null));
-    };
-
-    const handleUp = () => {
-      setInteractionMode("none");
-      setMarqueeRect((rect) => {
-        if (!rect) return null;
-        const minX = Math.min(rect.startX, rect.curX);
-        const maxX = Math.max(rect.startX, rect.curX);
-        const minY = Math.min(rect.startY, rect.curY);
-        const maxY = Math.max(rect.startY, rect.curY);
-
-        if (maxX - minX < 1.2 && maxY - minY < 1.0) {
-          handleSelectBlock(null);
-          return null;
-        }
-
-        const pageWords = wordTokensByPage[currentPage] || [];
-        const selectedWords = pageWords.filter((w) => {
-          const cx = w.origXPercent + w.origWidthPercent / 2;
-          const cy = w.origYPercent + w.origHeightPercent / 2;
-          return cx >= minX && cx <= maxX && cy >= minY && cy <= maxY;
-        });
-
-        if (selectedWords.length === 0) {
-          return null;
-        }
-
-        const sorted = [...selectedWords].sort((a, b) => {
-          if (Math.abs(a.origBaselineYPercent - b.origBaselineYPercent) > 0.8) {
-            return a.origBaselineYPercent - b.origBaselineYPercent;
-          }
-          return a.origXPercent - b.origXPercent;
-        });
-
-        const lineTexts: string[] = [];
-        let curLineWords: TextBlockItem[] = [];
-        for (const sw of sorted) {
-          const prevW = curLineWords[curLineWords.length - 1];
-          if (prevW && Math.abs(prevW.origBaselineYPercent - sw.origBaselineYPercent) > 0.8) {
-            lineTexts.push(curLineWords.map((x) => x.originalText).join(" "));
-            curLineWords = [sw];
-          } else {
-            curLineWords.push(sw);
-          }
-        }
-        if (curLineWords.length > 0) {
-          lineTexts.push(curLineWords.map((x) => x.originalText).join(" "));
-        }
-
-        const combinedText = lineTexts.join("\n");
-        const firstWord = sorted[0];
-        const boxLeft = Math.min(...sorted.map((w) => w.origXPercent));
-        const boxTop = Math.min(...sorted.map((w) => w.origYPercent));
-        const boxRight = Math.max(...sorted.map((w) => w.origXPercent + w.origWidthPercent));
-        const boxBottom = Math.max(...sorted.map((w) => w.origYPercent + w.origHeightPercent));
-        const boxW = Math.max(2, boxRight - boxLeft);
-        const boxH = Math.max(1.4, boxBottom - boxTop);
-
-        const customId = `custom_sel_${Date.now()}`;
-        const customBlock: TextBlockItem = {
-          ...firstWord,
-          id: customId,
-          originalText: combinedText,
-          currentText: combinedText,
-          isMultiline: lineTexts.length > 1,
-          lineHeightPt: Math.round(firstWord.rawFontSizePt * 1.32 * 10) / 10,
-          origFontSizePt: firstWord.rawFontSizePt,
-          fontSizePt: firstWord.rawFontSizePt,
-          origXPercent: boxLeft,
-          origYPercent: boxTop,
-          origBaselineYPercent: firstWord.origBaselineYPercent,
-          origWidthPercent: boxW,
-          origHeightPercent: boxH,
-          xPercent: boxLeft,
-          yPercent: boxTop,
-          widthPercent: boxW,
-          heightPercent: boxH,
-        };
-
-        setTextBlocks((prev) => [...prev, customBlock]);
-        handleSelectBlock(customBlock);
-        return null;
-      });
-    };
-
-    window.addEventListener("pointermove", handleMove);
-    window.addEventListener("pointerup", handleUp);
-    return () => {
-      window.removeEventListener("pointermove", handleMove);
-      window.removeEventListener("pointerup", handleUp);
-    };
-  }, [interactionMode, currentPage, wordTokensByPage, handleSelectBlock]);
-
-  const handleUpdateBlock = useCallback(
-    (id: string, patch: Partial<TextBlockItem>, recordHistory: boolean = true) => {
-      setTextBlocks((prev) => {
-        if (recordHistory) {
-          pushUndoSnapshot(prev);
-        }
-        return prev.map((b) => (b.id === id ? { ...b, ...patch } : b));
-      });
-    },
-    [pushUndoSnapshot]
-  );
-
-  const handleAddFreeText = () => {
-    pushUndoSnapshot(textBlocks);
-    const newId = `new_txt_${Date.now()}`;
-    const newBlock: TextBlockItem = {
-      id: newId,
-      pageNumber: currentPage,
-      originalText: "",
-      currentText: "New Text",
-      isNew: true,
-      rawFontSizePt: 11,
-      origXPercent: 25,
-      origYPercent: 25,
-      origBaselineYPercent: 26.8,
-      origWidthPercent: 28,
-      origHeightPercent: 3.5,
-      xPercent: 25,
-      yPercent: 25,
-      widthPercent: 28,
-      heightPercent: 3.5,
-      origFontSizePt: 11,
-      origFontFamily: docDefaultFontRef.current,
-      origColor: "#2e3138",
-      origIsBold: false,
-      origIsItalic: false,
-      fontSizePt: 11,
-      fontFamily: docDefaultFontRef.current,
-      color: "#2e3138",
-      isBold: false,
-      isItalic: false,
-      textAlign: "left",
-      maskBg: "transparent",
-      autoBgHex: "#ffffff",
-      customMaskHex: "#ffffff",
-    };
-    setTextBlocks((prev) => [...prev, newBlock]);
-    handleSelectBlock(newBlock);
-    setPreviewCleanMode(false);
-  };
-
-  const handleAddWhiteoutBox = () => {
-    pushUndoSnapshot(textBlocks);
-    const newId = `whiteout_${Date.now()}`;
-    const newBlock: TextBlockItem = {
-      id: newId,
-      pageNumber: currentPage,
-      originalText: "__WHITEOUT__",
-      currentText: "",
-      isNew: true,
-      isWhiteoutOnly: true,
-      rawFontSizePt: 11,
-      origXPercent: 30,
-      origYPercent: 35,
-      origBaselineYPercent: 37,
-      origWidthPercent: 28,
-      origHeightPercent: 4.5,
-      xPercent: 30,
-      yPercent: 35,
-      widthPercent: 28,
-      heightPercent: 4.5,
-      origFontSizePt: 11,
-      origFontFamily: docDefaultFontRef.current,
-      origColor: "#2e3138",
-      origIsBold: false,
-      origIsItalic: false,
-      fontSizePt: 11,
-      fontFamily: docDefaultFontRef.current,
-      color: "#2e3138",
-      isBold: false,
-      isItalic: false,
-      textAlign: "left",
-      maskBg: "white",
-      autoBgHex: "#ffffff",
-      customMaskHex: "#ffffff",
-    };
-    setTextBlocks((prev) => [...prev, newBlock]);
-    handleSelectBlock(newBlock);
-    setPreviewCleanMode(false);
-  };
-
-  const handleDeleteOrClearBlock = useCallback(
-    (block: TextBlockItem) => {
-      pushUndoSnapshot(textBlocks);
-      if (block.isNew) {
-        setTextBlocks((prev) => prev.filter((b) => b.id !== block.id));
-      } else {
-        setTextBlocks((prev) =>
-          prev.map((b) => (b.id === block.id ? { ...b, currentText: "" } : b))
-        );
-      }
-      handleSelectBlock(null);
-    },
-    [pushUndoSnapshot, textBlocks, handleSelectBlock]
-  );
-
-  const handleRestoreOriginalBlock = (id: string) => {
-    pushUndoSnapshot(textBlocks);
-    setTextBlocks((prev) =>
-      prev.map((b) => {
-        if (b.id !== id) return b;
-        return {
-          ...b,
-          currentText: b.originalText,
-          fontSizePt: b.origFontSizePt,
-          fontFamily: b.origFontFamily,
-          color: b.origColor,
-          isBold: b.origIsBold,
-          isItalic: b.origIsItalic,
-          xPercent: b.origXPercent,
-          yPercent: b.origYPercent,
-          widthPercent: b.origWidthPercent,
-          heightPercent: b.origHeightPercent,
-        };
-      })
-    );
-  };
-
-  const matchingBlocks = findQuery.trim()
-    ? textBlocks.filter((b) => {
-        if (b.isWhiteoutOnly || !b.currentText) return false;
-        return caseSensitiveFind
-          ? b.currentText.includes(findQuery)
-          : b.currentText.toLowerCase().includes(findQuery.toLowerCase());
-      })
+  // Find & Replace across all extracted lines
+  const findMatches = findText.trim()
+    ? lines.filter((l) =>
+        matchCase
+          ? l.text.includes(findText)
+          : l.text.toLowerCase().includes(findText.toLowerCase())
+      )
     : [];
 
-  const handleReplaceMatches = (scope: "page" | "all") => {
-    if (!findQuery.trim()) return;
-    const escaped = findQuery.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const regex = new RegExp(escaped, caseSensitiveFind ? "g" : "gi");
-
-    let replacedCount = 0;
-    pushUndoSnapshot(textBlocks);
-    setTextBlocks((prev) =>
-      prev.map((b) => {
-        if (b.isWhiteoutOnly || !b.currentText) return b;
-        if (scope === "page" && b.pageNumber !== currentPage) return b;
-        if (!regex.test(b.currentText)) return b;
-        replacedCount++;
-        return {
-          ...b,
-          currentText: b.currentText.replace(regex, replaceQuery),
-        };
-      })
+  const handleReplaceAll = () => {
+    if (!findText.trim()) return;
+    const escaped = findText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const rx = new RegExp(escaped, matchCase ? "g" : "gi");
+    pushHistory();
+    setLines((prev) =>
+      prev.map((l) => (rx.test(l.text) ? { ...l, text: l.text.replace(rx, replaceText) } : l))
     );
+  };
 
-    if (replacedCount > 0) {
-      handleSelectBlock(null);
-      setSuccessMessage(
-        `Replaced ${replacedCount} occurrence(s) of "${findQuery}" with "${replaceQuery}" (${
-          scope === "all" ? "entire PDF" : `Page ${currentPage}`
-        }).`
-      );
+  // Click on page canvas to add "Type your text", form mark, or start drawing box
+  const handlePagePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0 || !pageWrapperRef.current) return;
+    setOpenDropdown(null);
+
+    const rect = pageWrapperRef.current.getBoundingClientRect();
+    const scale = rect.width / pageSizePt.width;
+    const clickXPt = (e.clientX - rect.left) / scale;
+    const clickYPt = (e.clientY - rect.top) / scale;
+
+    if (activeTool === "text") {
+      // If user already had a line selected, first click on blank paper deselects;
+      // clicking blank paper when nothing is selected drops a Sejda "Type your text" box!
+      if (selectedId) {
+        setSelectedId(null);
+        return;
+      }
+      pushHistory();
+      const newId = `new_line_${Date.now()}`;
+      const newLine: LiveTextLine = {
+        id: newId,
+        pageNumber: currentPage,
+        originalText: "",
+        text: "Type your text",
+        isNew: true,
+        origXPt: clickXPt,
+        origYPt: clickYPt - 10,
+        origBaselineYPt: clickYPt,
+        origWidthPt: 95,
+        origHeightPt: 16,
+        xPt: Math.max(10, Math.min(pageSizePt.width - 100, clickXPt)),
+        yPt: Math.max(10, Math.min(pageSizePt.height - 24, clickYPt - 10)),
+        widthPt: 95,
+        heightPt: 16,
+        fontSizePt: 12,
+        fontId: defaultFontIdRef.current,
+        color: "#000000",
+        isBold: false,
+        isItalic: false,
+        bgHex: "transparent",
+      };
+      setLines((prev) => [...prev, newLine]);
+      setSelectedId(newId);
+      return;
+    }
+
+    if (activeTool === "forms") {
+      pushHistory();
+      const id = `form_${Date.now()}`;
+      const isField = formSubTool === "textfield";
+      const newOv: OverlayItem = {
+        id,
+        pageNumber: currentPage,
+        kind: formSubTool,
+        xPt: clickXPt - (isField ? 50 : 8),
+        yPt: clickYPt - 9,
+        wPt: isField ? 120 : 18,
+        hPt: 18,
+        color: "#0f172a",
+        text: isField ? "Text field" : formSubTool === "check" ? "✓" : formSubTool === "cross" ? "✕" : "•",
+      };
+      setOverlays((prev) => [...prev, newOv]);
+      setSelectedId(id);
+      return;
+    }
+
+    if (activeTool === "sign") {
+      setShowSignModal(true);
+      return;
+    }
+
+    if (activeTool === "images") {
+      imageInputRef.current?.click();
+      return;
+    }
+
+    if (activeTool === "annotate" && annotateSubTool === "freehand") {
+      setDragState({
+        kind: "freehand",
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        startXPt: clickXPt,
+        startYPt: clickYPt,
+        startWPt: 0,
+        startHPt: 0,
+        curXPt: clickXPt,
+        curYPt: clickYPt,
+        points: [{ x: clickXPt, y: clickYPt }],
+        snapshotBefore: { lines, overlays },
+      });
+      return;
+    }
+
+    if (
+      activeTool === "whiteout" ||
+      activeTool === "links" ||
+      activeTool === "annotate" ||
+      activeTool === "shapes"
+    ) {
+      setDragState({
+        kind: "draw-box",
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        startXPt: clickXPt,
+        startYPt: clickYPt,
+        startWPt: 0,
+        startHPt: 0,
+        curXPt: clickXPt,
+        curYPt: clickYPt,
+        snapshotBefore: { lines, overlays },
+      });
     }
   };
 
+  // Global pointer move / up for dragging lines, resizing overlays, or drawing shapes/highlights
   useEffect(() => {
-    if (!file) return;
-    const onKeyDown = (e: KeyboardEvent) => {
-      const activeTag = document.activeElement?.tagName.toLowerCase();
-      const isTypingInInput = activeTag === "input" || activeTag === "textarea";
+    if (!dragState) return;
 
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "z") {
-        if (!isTypingInInput) {
-          e.preventDefault();
-          if (e.shiftKey) {
-            handleRedo();
-          } else {
-            handleUndo();
+    const onMove = (e: PointerEvent) => {
+      if (!pageWrapperRef.current) return;
+      const rect = pageWrapperRef.current.getBoundingClientRect();
+      const scale = rect.width / pageSizePt.width;
+      const dxPt = (e.clientX - dragState.startClientX) / scale;
+      const dyPt = (e.clientY - dragState.startClientY) / scale;
+      const curXPt = Math.max(0, Math.min(pageSizePt.width, (e.clientX - rect.left) / scale));
+      const curYPt = Math.max(0, Math.min(pageSizePt.height, (e.clientY - rect.top) / scale));
+
+      if (dragState.kind === "move-line" && dragState.targetId) {
+        setLines((prev) =>
+          prev.map((l) =>
+            l.id === dragState.targetId
+              ? {
+                  ...l,
+                  xPt: Math.max(0, Math.min(pageSizePt.width - 20, dragState.startXPt + dxPt)),
+                  yPt: Math.max(0, Math.min(pageSizePt.height - 12, dragState.startYPt + dyPt)),
+                }
+              : l
+          )
+        );
+      } else if (dragState.kind === "move-overlay" && dragState.targetId) {
+        setOverlays((prev) =>
+          prev.map((o) =>
+            o.id === dragState.targetId
+              ? {
+                  ...o,
+                  xPt: Math.max(0, Math.min(pageSizePt.width - 10, dragState.startXPt + dxPt)),
+                  yPt: Math.max(0, Math.min(pageSizePt.height - 10, dragState.startYPt + dyPt)),
+                }
+              : o
+          )
+        );
+      } else if (dragState.kind === "resize-overlay" && dragState.targetId) {
+        setOverlays((prev) =>
+          prev.map((o) =>
+            o.id === dragState.targetId
+              ? {
+                  ...o,
+                  wPt: Math.max(12, dragState.startWPt + dxPt),
+                  hPt: Math.max(10, dragState.startHPt + dyPt),
+                }
+              : o
+          )
+        );
+      } else if (dragState.kind === "freehand") {
+        setDragState((prev) =>
+          prev
+            ? {
+                ...prev,
+                curXPt,
+                curYPt,
+                points: [...(prev.points || []), { x: curXPt, y: curYPt }],
+              }
+            : null
+        );
+      } else if (dragState.kind === "draw-box") {
+        setDragState((prev) => (prev ? { ...prev, curXPt, curYPt } : null));
+      }
+    };
+
+    const onUp = () => {
+      if (dragState.kind === "move-line" || dragState.kind === "move-overlay" || dragState.kind === "resize-overlay") {
+        pushHistory(dragState.snapshotBefore);
+      } else if (dragState.kind === "freehand" && dragState.points && dragState.points.length > 2) {
+        pushHistory(dragState.snapshotBefore);
+        const xs = dragState.points.map((p) => p.x);
+        const ys = dragState.points.map((p) => p.y);
+        const minX = Math.min(...xs);
+        const minY = Math.min(...ys);
+        const maxX = Math.max(...xs);
+        const maxY = Math.max(...ys);
+        const id = `freehand_${Date.now()}`;
+        setOverlays((prev) => [
+          ...prev,
+          {
+            id,
+            pageNumber: currentPage,
+            kind: "freehand",
+            xPt: minX,
+            yPt: minY,
+            wPt: Math.max(10, maxX - minX),
+            hPt: Math.max(10, maxY - minY),
+            color: "#dc2626",
+            strokeWidthPt: 2,
+            points: dragState.points,
+          },
+        ]);
+        setSelectedId(id);
+      } else if (dragState.kind === "draw-box") {
+        const minX = Math.min(dragState.startXPt, dragState.curXPt);
+        const minY = Math.min(dragState.startYPt, dragState.curYPt);
+        const w = Math.abs(dragState.curXPt - dragState.startXPt);
+        const h = Math.abs(dragState.curYPt - dragState.startYPt);
+
+        if (w > 6 || h > 6) {
+          pushHistory(dragState.snapshotBefore);
+          const id = `ov_${Date.now()}`;
+          let kind: OverlayItem["kind"] = "whiteout";
+          let color = "#2563eb";
+          let fillColor = "transparent";
+          let linkUrl: string | undefined;
+
+          if (activeTool === "whiteout") {
+            kind = "whiteout";
+            color = "#ffffff";
+            fillColor = "#ffffff";
+          } else if (activeTool === "links") {
+            kind = "link";
+            color = "#2563eb";
+            linkUrl = "https://";
+          } else if (activeTool === "annotate") {
+            kind = annotateSubTool;
+            color =
+              annotateSubTool === "highlight"
+                ? "#facc15"
+                : annotateSubTool === "strike"
+                  ? "#dc2626"
+                  : "#2563eb";
+          } else if (activeTool === "shapes") {
+            kind = shapeSubTool;
+            color = "#1e293b";
           }
-        }
-      } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "y") {
-        if (!isTypingInInput) {
-          e.preventDefault();
-          handleRedo();
-        }
-      } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") {
-        e.preventDefault();
-        setShowFindReplace((v) => !v);
-      } else if (e.key === "Escape") {
-        handleSelectBlock(null);
-      } else if (
-        (e.key === "Delete" || e.key === "Backspace") &&
-        !isTypingInInput &&
-        selectedBlockId
-      ) {
-        const blk = textBlocks.find((b) => b.id === selectedBlockId);
-        if (blk) {
-          e.preventDefault();
-          handleDeleteOrClearBlock(blk);
+
+          setOverlays((prev) => [
+            ...prev,
+            {
+              id,
+              pageNumber: currentPage,
+              kind,
+              xPt: minX,
+              yPt: minY,
+              wPt: Math.max(16, w),
+              hPt: Math.max(12, h),
+              color,
+              fillColor,
+              strokeWidthPt: 2,
+              linkUrl,
+            },
+          ]);
+          setSelectedId(id);
         }
       }
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [file, selectedBlockId, textBlocks, handleUndo, handleRedo, handleDeleteOrClearBlock, handleSelectBlock]);
-
-  const handleStartInteraction = (
-    block: TextBlockItem,
-    mode: "drag" | "resize",
-    e: React.PointerEvent
-  ) => {
-    e.stopPropagation();
-    e.preventDefault();
-    handleSelectBlock(block);
-    setInteractionMode(mode);
-    interactionRef.current = {
-      id: block.id,
-      clientX: e.clientX,
-      clientY: e.clientY,
-      origX: block.xPercent,
-      origY: block.yPercent,
-      origW: block.widthPercent,
-      origH: block.heightPercent,
-      snapshotBeforeDrag: textBlocks,
-    };
-  };
-
-  useEffect(() => {
-    if (interactionMode !== "drag" && interactionMode !== "resize") return;
-
-    const handleMove = (e: PointerEvent) => {
-      if (!interactionRef.current || !pdfCanvasRef.current) return;
-      const rect = pdfCanvasRef.current.getBoundingClientRect();
-      if (rect.width <= 0 || rect.height <= 0) return;
-
-      const dx = ((e.clientX - interactionRef.current.clientX) / rect.width) * 100;
-      const dy = ((e.clientY - interactionRef.current.clientY) / rect.height) * 100;
-      const targetId = interactionRef.current.id;
-
-      if (interactionMode === "drag") {
-        const newX = Math.max(0, Math.min(96, interactionRef.current.origX + dx));
-        const newY = Math.max(0, Math.min(96, interactionRef.current.origY + dy));
-        setTextBlocks((prev) =>
-          prev.map((b) => (b.id === targetId ? { ...b, xPercent: newX, yPercent: newY } : b))
-        );
-      } else if (interactionMode === "resize") {
-        const newW = Math.max(
-          2,
-          Math.min(100 - interactionRef.current.origX, interactionRef.current.origW + dx)
-        );
-        const newH = Math.max(
-          1.2,
-          Math.min(100 - interactionRef.current.origY, interactionRef.current.origH + dy)
-        );
-        setTextBlocks((prev) =>
-          prev.map((b) => (b.id === targetId ? { ...b, widthPercent: newW, heightPercent: newH } : b))
-        );
-      }
+      setDragState(null);
     };
 
-    const handleUp = () => {
-      if (interactionRef.current) {
-        pushUndoSnapshot(interactionRef.current.snapshotBeforeDrag);
-      }
-      setInteractionMode("none");
-      interactionRef.current = null;
-    };
-
-    window.addEventListener("pointermove", handleMove);
-    window.addEventListener("pointerup", handleUp);
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
     return () => {
-      window.removeEventListener("pointermove", handleMove);
-      window.removeEventListener("pointerup", handleUp);
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
     };
-  }, [interactionMode, pushUndoSnapshot]);
+  }, [dragState, pageSizePt, currentPage, activeTool, annotateSubTool, shapeSubTool, pushHistory]);
 
-  const renderReplacementTextToPng = (
-    block: TextBlockItem,
-    boxWidthPt: number,
-    boxHeightPt: number
-  ): { bytes: Uint8Array; widthPt: number; heightPt: number } => {
-    const SCALE = 3;
-    const measureCanvas = document.createElement("canvas");
-    const mCtx = measureCanvas.getContext("2d")!;
-    const fontPx = Math.max(6.5, block.fontSizePt) * SCALE;
-    const fontStylePrefix = `${block.isItalic ? "italic " : ""}${block.isBold ? "bold " : ""}`;
-    const fontSpec = `${fontStylePrefix}${fontPx}px ${FONT_CSS_MAP[block.fontFamily]}`;
-    mCtx.font = fontSpec;
-
-    const wrappedLines = wrapTextIntoLines(
-      mCtx,
-      block.currentText,
-      boxWidthPt * SCALE,
-      block.isMultiline
-    );
-    const lineStepPx = (block.lineHeightPt || block.fontSizePt * 1.3) * SCALE;
-    const measuredW = Math.max(
-      ...wrappedLines.map((l) => mCtx.measureText(l).width + 2 * SCALE)
-    );
-    const finalW = Math.max(boxWidthPt * SCALE, measuredW);
-    const finalH =
-      wrappedLines.length > 1
-        ? (wrappedLines.length - 1) * lineStepPx + fontPx * 1.18
-        : Math.max(boxHeightPt * SCALE, fontPx * 1.12);
-
-    const canvas = document.createElement("canvas");
-    canvas.width = Math.max(1, Math.ceil(finalW));
-    canvas.height = Math.max(1, Math.ceil(finalH));
-    const ctx = canvas.getContext("2d")!;
-
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-    const isRTL = /[\u0600-\u06FF]/.test(block.currentText);
-    ctx.direction = isRTL ? "rtl" : "ltr";
-    ctx.font = fontSpec;
-    ctx.fillStyle = block.color;
-    ctx.textBaseline = "alphabetic";
-
-    const firstBaselineY = fontPx * 0.82;
-
-    wrappedLines.forEach((lineText, idx) => {
-      const baselineY = firstBaselineY + idx * lineStepPx;
-      if (isRTL || block.textAlign === "right") {
-        ctx.textAlign = "right";
-        ctx.fillText(lineText, canvas.width - 1 * SCALE, baselineY);
-      } else if (block.textAlign === "center") {
-        ctx.textAlign = "center";
-        ctx.fillText(lineText, canvas.width / 2, baselineY);
-      } else {
-        ctx.textAlign = "left";
-        ctx.fillText(lineText, 0, baselineY);
-      }
-    });
-
-    const dataUrl = canvas.toDataURL("image/png");
-    return {
-      bytes: dataUrlToUint8Array(dataUrl),
-      widthPt: canvas.width / SCALE,
-      heightPt: canvas.height / SCALE,
+  // Handle Image Upload onto Page
+  const handleImageFileSelected = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const imgFile = e.target.files?.[0];
+    if (!imgFile) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = reader.result as string;
+      const img = new Image();
+      img.onload = () => {
+        pushHistory();
+        const aspect = img.width / Math.max(1, img.height);
+        const wPt = 140;
+        const hPt = Math.round(wPt / aspect);
+        const id = `img_${Date.now()}`;
+        setOverlays((prev) => [
+          ...prev,
+          {
+            id,
+            pageNumber: currentPage,
+            kind: "image",
+            xPt: pageSizePt.width / 2 - wPt / 2,
+            yPt: pageSizePt.height / 3,
+            wPt,
+            hPt,
+            color: "#000000",
+            dataUrl,
+          },
+        ]);
+        setSelectedId(id);
+        setActiveTool("text");
+      };
+      img.src = dataUrl;
     };
+    reader.readAsDataURL(imgFile);
+    e.target.value = "";
   };
 
-  const modifiedBlocks = textBlocks.filter(isBlockModified);
+  // Signature Modal: Save Drawn or Typed Signature onto Page
+  const handlePlaceSignature = () => {
+    let dataUrl = "";
+    if (signMode === "draw" && signPadCanvasRef.current) {
+      dataUrl = signPadCanvasRef.current.toDataURL("image/png");
+    } else if (signMode === "type" && typedSignature.trim()) {
+      const c = document.createElement("canvas");
+      c.width = 480;
+      c.height = 140;
+      const ctx = c.getContext("2d")!;
+      ctx.font = '700 64px "Dancing Script", "Brush Script MT", cursive';
+      ctx.fillStyle = signColor;
+      ctx.textBaseline = "middle";
+      ctx.fillText(typedSignature.trim(), 20, 75);
+      dataUrl = c.toDataURL("image/png");
+    }
+    if (!dataUrl) return;
 
-  const handleSaveEditedPdf = async () => {
-    if (!file) return;
-    setIsSaving(true);
+    pushHistory();
+    const id = `sig_${Date.now()}`;
+    setOverlays((prev) => [
+      ...prev,
+      {
+        id,
+        pageNumber: currentPage,
+        kind: "signature",
+        xPt: pageSizePt.width / 2 - 75,
+        yPt: pageSizePt.height * 0.65,
+        wPt: 150,
+        hPt: 45,
+        color: signColor,
+        dataUrl,
+      },
+    ]);
+    setSelectedId(id);
+    setShowSignModal(false);
+    setActiveTool("text");
+  };
+
+  // ============================================================================
+  // MODULE 4: SEJDA "APPLY CHANGES >" HIGH-FIDELITY PDF EXPORT ENGINE
+  // ============================================================================
+  const handleApplyChanges = async () => {
+    if (!file || !pdfDocProxy) return;
+    setIsApplying(true);
     setErrorMessage(null);
-    setSuccessMessage(null);
-    setSelectedBlockId(null);
+    setSelectedId(null);
 
     try {
-      let workingBlocks = [...textBlocks];
-      if (findQuery.trim() && workingBlocks.filter(isBlockModified).length === 0) {
-        const escaped = findQuery.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        const regex = new RegExp(escaped, caseSensitiveFind ? "g" : "gi");
-        workingBlocks = workingBlocks.map((b) =>
-          !b.isWhiteoutOnly && regex.test(b.currentText)
-            ? { ...b, currentText: b.currentText.replace(regex, replaceQuery) }
-            : b
-        );
-        setTextBlocks(workingBlocks);
-      }
+      const EXPORT_SCALE = 2.5;
+      const outPdf = await PDFDocument.create();
 
-      const modifiedCount = workingBlocks.filter(isBlockModified).length;
-      const arrayBuffer = await file.arrayBuffer();
+      const workingLines = [...lines];
+      for (let p = 1; p <= totalPages; p++) {
+        if (!extractedPagesRef.current.has(p)) {
+          extractedPagesRef.current.add(p);
+          const { builtLines } = await extractAndRenderPage(pdfDocProxy, p);
+          workingLines.push(...builtLines);
+        }
 
-      try {
-        const pdfDoc = await PDFDocument.load(arrayBuffer, { ignoreEncryption: true });
-        const pages = pdfDoc.getPages();
+        const page = await pdfDocProxy.getPage(p);
+        const baseVp = page.getViewport({ scale: 1.0 });
+        const pW = baseVp.width;
+        const pH = baseVp.height;
 
-        for (let pageIdx = 0; pageIdx < pages.length; pageIdx++) {
-          const pageNum = pageIdx + 1;
-          const page = pages[pageIdx];
-          const { width: pageW, height: pageH } = page.getSize();
-          const pBlocks = workingBlocks.filter((b) => b.pageNumber === pageNum);
-          const reflowMap = computePageReflowMap(pBlocks, pageW);
-          const blocksToDraw = pBlocks.filter((b) => reflowMap.get(b.id)?.needsRedraw);
+        const expVp = page.getViewport({ scale: EXPORT_SCALE });
+        const cnv = document.createElement("canvas");
+        cnv.width = Math.ceil(expVp.width);
+        cnv.height = Math.ceil(expVp.height);
+        const ctx = cnv.getContext("2d")!;
 
-          if (blocksToDraw.length === 0) continue;
+        // 1. Draw clean text-free background at high DPI
+        const cachedClean = cleanBgCanvasByPageRef.current[p];
+        if (cachedClean) {
+          ctx.drawImage(cachedClean, 0, 0, cnv.width, cnv.height);
+        } else {
+          ctx.fillText = () => {};
+          ctx.strokeText = () => {};
+          await page.render({ canvasContext: ctx, viewport: expVp }).promise;
+        }
 
-          // Pre-render replacement PNGs so Pass 1 can paint all paper masks before Pass 2 draws text
-          const renderedMap = new Map<
-            string,
-            { bytes: Uint8Array; widthPt: number; heightPt: number }
-          >();
+        // 2. Draw all Whiteouts & Highlights behind text
+        const pageOverlays = overlays.filter((o) => o.pageNumber === p);
+        for (const ov of pageOverlays) {
+          const ox = ov.xPt * EXPORT_SCALE;
+          const oy = ov.yPt * EXPORT_SCALE;
+          const ow = ov.wPt * EXPORT_SCALE;
+          const oh = ov.hPt * EXPORT_SCALE;
 
-          for (const block of blocksToDraw) {
-            if (!block.isWhiteoutOnly && block.currentText.trim()) {
-              const curW = (block.widthPercent / 100) * pageW;
-              const curH = (block.heightPercent / 100) * pageH;
-              renderedMap.set(block.id, renderReplacementTextToPng(block, curW, curH));
-            }
+          if (ov.kind === "whiteout") {
+            ctx.fillStyle = ov.fillColor || "#ffffff";
+            ctx.fillRect(ox, oy, ow, oh);
+          } else if (ov.kind === "highlight") {
+            ctx.save();
+            ctx.globalAlpha = 0.38;
+            ctx.fillStyle = ov.color || "#facc15";
+            ctx.fillRect(ox, oy, ow, oh);
+            ctx.restore();
           }
+        }
 
-          // PASS 1: Paint all paper background masks first so no mask ever clips adjacent shifted text
-          for (const block of blocksToDraw) {
-            const maskHex = resolveMaskHex(block);
-            const effectiveXPct = reflowMap.get(block.id)?.effectiveXPercent ?? block.xPercent;
+        // 3. Draw 100% of live text lines on the page with identical typography
+        const pageLines = workingLines.filter((l) => l.pageNumber === p);
+        for (const ln of pageLines) {
+          if (!ln.text.trim()) continue;
+          const fontPx = ln.fontSizePt * EXPORT_SCALE;
+          const prefix = `${ln.isItalic ? "italic " : ""}${ln.isBold ? "700 " : "400 "}`;
+          ctx.font = `${prefix}${fontPx}px ${getFontCss(ln.fontId)}`;
+          ctx.fillStyle = ln.color;
+          ctx.textBaseline = "alphabetic";
+          const baselineY = (ln.yPt + ln.fontSizePt * 0.84) * EXPORT_SCALE;
+          ctx.fillText(ln.text, ln.xPt * EXPORT_SCALE, baselineY);
+        }
 
-            if (!block.isNew && maskHex !== "transparent") {
-              const origW = (block.origWidthPercent / 100) * pageW;
-              const origH = (block.origHeightPercent / 100) * pageH;
-              const origX = (block.origXPercent / 100) * pageW;
-              const origY = pageH - (block.origYPercent / 100) * pageH - origH;
-              const { r, g, b } = hexToRgbComponents(maskHex);
+        // 4. Draw foreground Shapes, Forms, Images, Signatures, Freehand
+        for (const ov of pageOverlays) {
+          const ox = ov.xPt * EXPORT_SCALE;
+          const oy = ov.yPt * EXPORT_SCALE;
+          const ow = ov.wPt * EXPORT_SCALE;
+          const oh = ov.hPt * EXPORT_SCALE;
 
-              page.drawRectangle({
-                x: Math.max(0, origX - 1),
-                y: Math.max(0, origY - 0.8),
-                width: origW + 2,
-                height: origH + 1.6,
-                color: rgb(r, g, b),
-              });
+          if (ov.kind === "strike") {
+            ctx.strokeStyle = ov.color || "#dc2626";
+            ctx.lineWidth = 2 * EXPORT_SCALE;
+            ctx.beginPath();
+            ctx.moveTo(ox, oy + oh / 2);
+            ctx.lineTo(ox + ow, oy + oh / 2);
+            ctx.stroke();
+          } else if (ov.kind === "underline") {
+            ctx.strokeStyle = ov.color || "#2563eb";
+            ctx.lineWidth = 2 * EXPORT_SCALE;
+            ctx.beginPath();
+            ctx.moveTo(ox, oy + oh);
+            ctx.lineTo(ox + ow, oy + oh);
+            ctx.stroke();
+          } else if (ov.kind === "rect") {
+            ctx.strokeStyle = ov.color;
+            ctx.lineWidth = (ov.strokeWidthPt || 2) * EXPORT_SCALE;
+            ctx.strokeRect(ox, oy, ow, oh);
+          } else if (ov.kind === "ellipse") {
+            ctx.strokeStyle = ov.color;
+            ctx.lineWidth = (ov.strokeWidthPt || 2) * EXPORT_SCALE;
+            ctx.beginPath();
+            ctx.ellipse(ox + ow / 2, oy + oh / 2, ow / 2, oh / 2, 0, 0, Math.PI * 2);
+            ctx.stroke();
+          } else if (ov.kind === "line" || ov.kind === "arrow") {
+            ctx.strokeStyle = ov.color;
+            ctx.lineWidth = (ov.strokeWidthPt || 2) * EXPORT_SCALE;
+            ctx.beginPath();
+            ctx.moveTo(ox, oy + oh / 2);
+            ctx.lineTo(ox + ow, oy + oh / 2);
+            ctx.stroke();
+            if (ov.kind === "arrow") {
+              const head = 7 * EXPORT_SCALE;
+              ctx.beginPath();
+              ctx.moveTo(ox + ow, oy + oh / 2);
+              ctx.lineTo(ox + ow - head, oy + oh / 2 - head * 0.6);
+              ctx.lineTo(ox + ow - head, oy + oh / 2 + head * 0.6);
+              ctx.closePath();
+              ctx.fillStyle = ov.color;
+              ctx.fill();
             }
-
-            const curW = (block.widthPercent / 100) * pageW;
-            const curH = (block.heightPercent / 100) * pageH;
-            const curX = (effectiveXPct / 100) * pageW;
-            const curTopPt = (block.yPercent / 100) * pageH;
-
-            if (block.isWhiteoutOnly) {
-              const fillHex = maskHex === "transparent" ? "#ffffff" : maskHex;
-              const { r, g, b } = hexToRgbComponents(fillHex);
-              page.drawRectangle({
-                x: Math.max(0, curX),
-                y: Math.max(0, pageH - curTopPt - curH),
-                width: curW,
-                height: curH,
-                color: rgb(r, g, b),
-              });
-            } else {
-              const rendered = renderedMap.get(block.id);
-              if (rendered && maskHex !== "transparent") {
-                const drawY = pageH - curTopPt - rendered.heightPt;
-                const { r, g, b } = hexToRgbComponents(maskHex);
-                page.drawRectangle({
-                  x: Math.max(0, curX - 0.8),
-                  y: Math.max(0, drawY - 0.5),
-                  width: rendered.widthPt + 1.6,
-                  height: rendered.heightPt + 1,
-                  color: rgb(r, g, b),
-                });
-              }
+          } else if (
+            ov.kind === "check" ||
+            ov.kind === "cross" ||
+            ov.kind === "dot" ||
+            ov.kind === "textfield"
+          ) {
+            ctx.font = `700 ${14 * EXPORT_SCALE}px Arial, sans-serif`;
+            ctx.fillStyle = ov.color || "#0f172a";
+            ctx.textBaseline = "top";
+            ctx.fillText(ov.text || "✓", ox, oy);
+          } else if (ov.kind === "freehand" && ov.points && ov.points.length > 1) {
+            ctx.strokeStyle = ov.color || "#dc2626";
+            ctx.lineWidth = (ov.strokeWidthPt || 2) * EXPORT_SCALE;
+            ctx.lineCap = "round";
+            ctx.lineJoin = "round";
+            ctx.beginPath();
+            ctx.moveTo(ov.points[0].x * EXPORT_SCALE, ov.points[0].y * EXPORT_SCALE);
+            for (let i = 1; i < ov.points.length; i++) {
+              ctx.lineTo(ov.points[i].x * EXPORT_SCALE, ov.points[i].y * EXPORT_SCALE);
             }
-          }
-
-          // PASS 2: Embed and draw all foreground text PNGs cleanly on top
-          for (const block of blocksToDraw) {
-            if (block.isWhiteoutOnly) continue;
-            const rendered = renderedMap.get(block.id);
-            if (!rendered) continue;
-
-            const effectiveXPct = reflowMap.get(block.id)?.effectiveXPercent ?? block.xPercent;
-            const curX = (effectiveXPct / 100) * pageW;
-            const curTopPt = (block.yPercent / 100) * pageH;
-            const drawY = pageH - curTopPt - rendered.heightPt;
-
-            const pngImg = await pdfDoc.embedPng(rendered.bytes);
-            page.drawImage(pngImg, {
-              x: curX,
-              y: drawY,
-              width: rendered.widthPt,
-              height: rendered.heightPt,
+            ctx.stroke();
+          } else if ((ov.kind === "image" || ov.kind === "signature") && ov.dataUrl) {
+            await new Promise<void>((resolve) => {
+              const im = new Image();
+              im.onload = () => {
+                ctx.drawImage(im, ox, oy, ow, oh);
+                resolve();
+              };
+              im.onerror = () => resolve();
+              im.src = ov.dataUrl!;
             });
           }
         }
 
-        const savedBytes = await pdfDoc.save({ useObjectStreams: true });
-        const outName = `edited_${file.name}`;
-        downloadBlob(savedBytes, outName);
-        setSuccessMessage(`Saved ${modifiedCount} text edit(s) into "${outName}".`);
-      } catch {
-        const fallbackDoc = await PDFDocument.create();
-        for (let p = 1; p <= totalPages; p++) {
-          const pdfPage = await pdfDocProxy.getPage(p);
-          const baseVp = pdfPage.getViewport({ scale: 1.0 });
-          const hiVp = pdfPage.getViewport({ scale: 2.0 });
-          const cnv = document.createElement("canvas");
-          cnv.width = Math.ceil(hiVp.width);
-          cnv.height = Math.ceil(hiVp.height);
-          const ctx = cnv.getContext("2d")!;
-          await pdfPage.render({ canvasContext: ctx, viewport: hiVp }).promise;
-
-          const pBlocks = workingBlocks.filter((b) => b.pageNumber === p);
-          const reflowMap = computePageReflowMap(pBlocks, baseVp.width);
-          const blocksToDraw = pBlocks.filter((b) => reflowMap.get(b.id)?.needsRedraw);
-
-          // Pass 1: Masks
-          for (const b of blocksToDraw) {
-            const mHex = resolveMaskHex(b);
-            if (!b.isNew && mHex !== "transparent") {
-              ctx.fillStyle = mHex;
-              ctx.fillRect(
-                (b.origXPercent / 100) * cnv.width - 1.5,
-                (b.origYPercent / 100) * cnv.height - 1,
-                (b.origWidthPercent / 100) * cnv.width + 3,
-                (b.origHeightPercent / 100) * cnv.height + 2
-              );
-            }
-          }
-
-          // Pass 2: Text
-          for (const b of blocksToDraw) {
-            if (!b.isWhiteoutOnly && b.currentText.trim()) {
-              const effectiveXPct = reflowMap.get(b.id)?.effectiveXPercent ?? b.xPercent;
-              const fPx = b.fontSizePt * 2.0;
-              ctx.font = `${b.isItalic ? "italic " : ""}${b.isBold ? "bold " : ""}${fPx}px ${
-                FONT_CSS_MAP[b.fontFamily]
-              }`;
-              ctx.fillStyle = b.color;
-              ctx.textBaseline = "alphabetic";
-              const movedV = Math.abs(b.yPercent - b.origYPercent) > 0.1;
-              const baseLine = movedV
-                ? (b.yPercent / 100) * cnv.height + fPx * 0.82
-                : (b.origBaselineYPercent / 100) * cnv.height;
-              const wrapped = wrapTextIntoLines(
-                ctx,
-                b.currentText,
-                (b.widthPercent / 100) * cnv.width,
-                b.isMultiline
-              );
-              const stepPx = (b.lineHeightPt || b.fontSizePt * 1.3) * 2.0;
-              wrapped.forEach((lnText, idx) => {
-                ctx.fillText(lnText, (effectiveXPct / 100) * cnv.width, baseLine + idx * stepPx);
-              });
-            }
-          }
-
-          const pngBytes = dataUrlToUint8Array(cnv.toDataURL("image/png"));
-          const embedded = await fallbackDoc.embedPng(pngBytes);
-          const newPage = fallbackDoc.addPage([baseVp.width, baseVp.height]);
-          newPage.drawImage(embedded, {
-            x: 0,
-            y: 0,
-            width: baseVp.width,
-            height: baseVp.height,
-          });
-        }
-        const fallbackBytes = await fallbackDoc.save();
-        const outName = `edited_${file.name}`;
-        downloadBlob(fallbackBytes, outName);
-        setSuccessMessage(`Saved ${modifiedCount} text edit(s) into "${outName}".`);
+        const pngBytes = dataUrlToBytes(cnv.toDataURL("image/png"));
+        const embeddedPng = await outPdf.embedPng(pngBytes);
+        const pdfPage = outPdf.addPage([pW, pH]);
+        pdfPage.drawImage(embeddedPng, {
+          x: 0,
+          y: 0,
+          width: pW,
+          height: pH,
+        });
       }
+
+      const finalBytes = await outPdf.save({ useObjectStreams: true });
+      const outName = `edited_${file.name}`;
+      downloadBlob(finalBytes, outName);
+      setReadyDownloadBlob({ bytes: finalBytes, name: outName });
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : "Failed to save edited PDF.";
-      setErrorMessage(msg);
+      setErrorMessage(err instanceof Error ? err.message : "Failed to export edited PDF.");
     } finally {
-      setIsSaving(false);
+      setIsApplying(false);
     }
   };
 
-  const selectedBlock = textBlocks.find((b) => b.id === selectedBlockId) || null;
-  const displayScale =
-    pageBaseSizePt.width > 0 ? containerCssWidth / pageBaseSizePt.width : 1.15;
+  const displayScale = 1.48 * (zoomPercent / 100);
+  const pageCssWidth = Math.round(pageSizePt.width * displayScale);
+  const pageCssHeight = Math.round(pageSizePt.height * displayScale);
+
+  const currentPageLines = lines.filter((l) => l.pageNumber === currentPage);
+  const currentPageOverlays = overlays.filter((o) => o.pageNumber === currentPage);
 
   return (
     <ToolLayout
-      title="Edit PDF Text Online"
-      description="Click any word, line, or paragraph in your PDF to edit it directly in-place just like a Microsoft Word document—preserving exact original font family, size, weight, and ink color."
+      title="Online PDF Editor (Sejda Style)"
+      description="Click directly on any line of text in your PDF to type and edit in-place with 100% matching typography, plus add Links, Forms, Images, Signatures, Whiteout, Annotations, and Shapes."
       faqs={[
         {
-          question: "How does it preserve the exact original font style and size?",
+          question: "Why does edited text match the rest of the page 100%?",
           answer:
-            "When your PDF loads, our engine reads the embedded PDF font table and canvas stroke metrics to lock each word's exact point size, weight (Regular vs Bold), and font family (including LaTeX Computer Modern, Calibri, Arial, and Monospace).",
+            "Just like Sejda PDF Editor, our engine renders the clean non-text page background on the canvas and converts every line on the page into a live editable DOM text layer—so newly typed words and existing words share the exact same font rendering.",
         },
         {
-          question: "What happens if my new word is longer than the original word?",
+          question: "How do I edit existing text vs adding new text?",
           answer:
-            "Our automatic same-line reflow engine shifts the remaining words on that line to the right so your edited word never overlaps or cuts off the next word.",
+            "With the 'Text' tool active, click directly on any existing sentence to type right inside it, or click on any blank space on the page to insert a new 'Type your text' block.",
         },
         {
-          question: "Can I use Up and Down arrow keys like in Microsoft Word?",
+          question: "Can I sign, whiteout, highlight, or insert images?",
           answer:
-            "Yes. While editing a line on the page, press the Up or Down arrow keys (or Enter) to move seamlessly between lines.",
+            "Yes! Use the Sejda-style top floating pill bar to switch between Text, Links, Forms, Images, Sign, Whiteout, Annotate, and Shapes, then click 'Apply changes' at the bottom.",
         },
       ]}
     >
-      <div className="space-y-6">
+      <div className="space-y-4">
+        <input
+          ref={imageInputRef}
+          type="file"
+          accept="image/png,image/jpeg,image/webp"
+          className="hidden"
+          onChange={handleImageFileSelected}
+        />
+
         {!file && (
           <FileDropzone
             accept="application/pdf,.pdf"
             multiple={false}
             onFilesSelected={handleFileSelected}
-            title="Drop a PDF document to edit existing text"
-            description="Click anywhere on your PDF page to edit text directly in-place like a Word document with locked original font size, style, and automatic line reflow."
+            title="Upload PDF file to edit"
+            description="Files stay 100% private in your browser. Click any text line to type in-place just like Sejda PDF Editor."
           />
         )}
 
         {file && (
-          <div className="space-y-3 rounded-2xl border border-slate-200 bg-slate-50/70 p-3 sm:p-5 dark:border-slate-800 dark:bg-slate-900/60">
-            {/* Row 1: Document Bar + Granularity + Actions */}
-            <div className="flex flex-wrap items-center justify-between gap-2.5 border-b border-slate-200 dark:border-slate-800 pb-3">
-              <div className="flex items-center gap-2.5">
-                <div className="flex h-9 w-9 items-center justify-center rounded-lg border border-blue-100 bg-blue-50 text-blue-600 dark:border-blue-900/40 dark:bg-blue-950/40 dark:text-blue-400">
-                  <FileEdit className="h-4 w-4" />
-                </div>
-                <div>
-                  <h2 className="text-xs sm:text-sm font-bold text-slate-900 dark:text-white truncate max-w-[180px] sm:max-w-xs">
-                    {file.name}
-                  </h2>
-                  <p className="font-mono text-[11px] text-slate-500 dark:text-slate-400">
-                    Page {currentPage} of {totalPages}
-                    {modifiedBlocks.length > 0 && (
-                      <span className="ml-1.5 text-emerald-600 dark:text-emerald-400 font-bold">
-                        • {modifiedBlocks.length} edited
-                      </span>
-                    )}
-                  </p>
-                </div>
-              </div>
-
-              <div className="flex flex-wrap items-center gap-1.5">
-                {/* Selection Mode: Word | Line | Paragraph */}
-                <div
-                  className="inline-flex items-center rounded-xl border border-slate-200 bg-white p-0.5 text-xs dark:border-slate-800 dark:bg-slate-900"
-                  title="Choose click granularity (or drag across any custom words)"
-                >
-                  <span className="hidden xl:inline-flex items-center gap-1 px-2 text-[11px] font-semibold text-slate-400">
-                    <MousePointerClick className="h-3.5 w-3.5 text-blue-600" />
-                    <span>Mode:</span>
-                  </span>
-                  {(
-                    [
-                      { id: "word", label: "Word" },
-                      { id: "line", label: "Line" },
-                      { id: "paragraph", label: "Paragraph" },
-                    ] as const
-                  ).map((mode) => (
-                    <button
-                      key={mode.id}
-                      type="button"
-                      onClick={() => {
-                        setSelectionGranularity(mode.id);
-                        handleSelectBlock(null);
-                      }}
-                      className={`rounded-lg px-2.5 py-1 text-xs font-bold transition-colors ${
-                        selectionGranularity === mode.id
-                          ? "bg-blue-600 text-white shadow-2xs"
-                          : "text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800"
-                      }`}
-                    >
-                      {mode.label}
-                    </button>
-                  ))}
-                </div>
-
-                {/* Undo / Redo */}
-                <div className="inline-flex items-center rounded-xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900 p-0.5">
+          <div className="relative flex flex-col items-center rounded-2xl border border-slate-300 bg-[#e8eaed] dark:border-slate-800 dark:bg-slate-950 min-h-[86vh] pb-24 overflow-hidden">
+            {/* ================================================================ */}
+            {/* MODULE 3: SEJDA TOP FLOATING PILL TOOLBAR                        */}
+            {/* ================================================================ */}
+            <div className="sticky top-0 z-40 flex w-full flex-col items-center bg-white/95 dark:bg-slate-900/95 border-b border-slate-200 dark:border-slate-800 py-2.5 px-3 shadow-xs backdrop-blur-xs">
+              <div className="flex flex-wrap items-center justify-center gap-0.5 rounded-lg border border-sky-300/90 bg-white dark:bg-slate-900 shadow-sm p-0.5">
+                {/* 1. TEXT TOOL */}
+                <div className="relative flex items-center">
                   <button
                     type="button"
-                    onClick={handleUndo}
-                    disabled={historyPast.length === 0}
-                    title="Undo (Ctrl+Z)"
-                    className="rounded-lg p-1.5 text-slate-600 hover:bg-slate-100 dark:text-slate-300 disabled:opacity-30"
+                    onClick={() => {
+                      setActiveTool("text");
+                      setOpenDropdown(null);
+                    }}
+                    className={`inline-flex items-center gap-1.5 rounded-l-md px-3 py-1.5 text-xs font-medium transition-colors ${
+                      activeTool === "text"
+                        ? "bg-sky-100/90 text-sky-800 font-semibold"
+                        : "text-sky-700 hover:bg-sky-50"
+                    }`}
                   >
-                    <Undo2 className="h-3.5 w-3.5" />
+                    <Type className="h-3.5 w-3.5 text-sky-600" />
+                    <span>Text</span>
                   </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setOpenDropdown(openDropdown === "text" ? null : "text")
+                    }
+                    className="border-l border-sky-200 px-1.5 py-1.5 text-sky-600 hover:bg-sky-50"
+                    title="Text options & Find/Replace"
+                  >
+                    <ChevronDown className="h-3 w-3" />
+                  </button>
+
+                  {openDropdown === "text" && (
+                    <div className="absolute left-0 top-full mt-1 w-48 rounded-lg border border-slate-200 bg-white py-1 shadow-xl z-50 text-xs">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setActiveTool("text");
+                          setSelectedId(null);
+                          setOpenDropdown(null);
+                        }}
+                        className="flex w-full items-center gap-2 px-3 py-2 text-left text-slate-700 hover:bg-sky-50"
+                      >
+                        <Type className="h-3.5 w-3.5 text-sky-600" />
+                        <span>Edit / Add Text</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setShowFindReplace((v) => !v);
+                          setOpenDropdown(null);
+                        }}
+                        className="flex w-full items-center gap-2 px-3 py-2 text-left text-slate-700 hover:bg-sky-50"
+                      >
+                        <Search className="h-3.5 w-3.5 text-sky-600" />
+                        <span>Find & Replace (Ctrl+F)</span>
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                {/* 2. LINKS TOOL */}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setActiveTool("links");
+                    setOpenDropdown(null);
+                  }}
+                  className={`inline-flex items-center gap-1.5 border-l border-sky-200 px-3 py-1.5 text-xs font-medium transition-colors ${
+                    activeTool === "links"
+                      ? "bg-sky-100/90 text-sky-800 font-semibold"
+                      : "text-sky-700 hover:bg-sky-50"
+                  }`}
+                >
+                  <LinkIcon className="h-3.5 w-3.5 text-sky-600" />
+                  <span>Links</span>
+                </button>
+
+                {/* 3. FORMS TOOL */}
+                <div className="relative flex items-center border-l border-sky-200">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setActiveTool("forms");
+                      setOpenDropdown(openDropdown === "forms" ? null : "forms");
+                    }}
+                    className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium transition-colors ${
+                      activeTool === "forms"
+                        ? "bg-sky-100/90 text-sky-800 font-semibold"
+                        : "text-sky-700 hover:bg-sky-50"
+                    }`}
+                  >
+                    <CheckSquare className="h-3.5 w-3.5 text-sky-600" />
+                    <span>Forms</span>
+                    <ChevronDown className="h-3 w-3 opacity-70" />
+                  </button>
+
+                  {openDropdown === "forms" && (
+                    <div className="absolute left-0 top-full mt-1 w-44 rounded-lg border border-slate-200 bg-white py-1 shadow-xl z-50 text-xs">
+                      {(
+                        [
+                          { id: "check", label: "✓ Checkmark" },
+                          { id: "cross", label: "✕ Cross mark" },
+                          { id: "dot", label: "• Radio dot" },
+                          { id: "textfield", label: "[Abc] Text field" },
+                        ] as const
+                      ).map((item) => (
+                        <button
+                          key={item.id}
+                          type="button"
+                          onClick={() => {
+                            setFormSubTool(item.id);
+                            setActiveTool("forms");
+                            setOpenDropdown(null);
+                          }}
+                          className="flex w-full items-center justify-between px-3 py-1.5 text-left text-slate-700 hover:bg-sky-50"
+                        >
+                          <span>{item.label}</span>
+                          {formSubTool === item.id && (
+                            <Check className="h-3.5 w-3.5 text-sky-600" />
+                          )}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* 4. IMAGES TOOL */}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setActiveTool("images");
+                    setOpenDropdown(null);
+                    imageInputRef.current?.click();
+                  }}
+                  className={`inline-flex items-center gap-1.5 border-l border-sky-200 px-3 py-1.5 text-xs font-medium transition-colors ${
+                    activeTool === "images"
+                      ? "bg-sky-100/90 text-sky-800 font-semibold"
+                      : "text-sky-700 hover:bg-sky-50"
+                  }`}
+                >
+                  <ImageIcon className="h-3.5 w-3.5 text-sky-600" />
+                  <span>Images</span>
+                  <ChevronDown className="h-3 w-3 opacity-70" />
+                </button>
+
+                {/* 5. SIGN TOOL */}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setActiveTool("sign");
+                    setOpenDropdown(null);
+                    setShowSignModal(true);
+                  }}
+                  className={`inline-flex items-center gap-1.5 border-l border-sky-200 px-3 py-1.5 text-xs font-medium transition-colors ${
+                    activeTool === "sign"
+                      ? "bg-sky-100/90 text-sky-800 font-semibold"
+                      : "text-sky-700 hover:bg-sky-50"
+                  }`}
+                >
+                  <PenTool className="h-3.5 w-3.5 text-sky-600" />
+                  <span>Sign</span>
+                  <ChevronDown className="h-3 w-3 opacity-70" />
+                </button>
+
+                {/* 6. WHITEOUT TOOL */}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setActiveTool("whiteout");
+                    setOpenDropdown(null);
+                  }}
+                  className={`inline-flex items-center gap-1.5 border-l border-sky-200 px-3 py-1.5 text-xs font-medium transition-colors ${
+                    activeTool === "whiteout"
+                      ? "bg-sky-100/90 text-sky-800 font-semibold"
+                      : "text-sky-700 hover:bg-sky-50"
+                  }`}
+                >
+                  <Eraser className="h-3.5 w-3.5 text-sky-600" />
+                  <span>Whiteout</span>
+                </button>
+
+                {/* 7. ANNOTATE TOOL */}
+                <div className="relative flex items-center border-l border-sky-200">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setActiveTool("annotate");
+                      setOpenDropdown(
+                        openDropdown === "annotate" ? null : "annotate"
+                      );
+                    }}
+                    className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium transition-colors ${
+                      activeTool === "annotate"
+                        ? "bg-sky-100/90 text-sky-800 font-semibold"
+                        : "text-sky-700 hover:bg-sky-50"
+                    }`}
+                  >
+                    <Highlighter className="h-3.5 w-3.5 text-sky-600" />
+                    <span>Annotate</span>
+                    <ChevronDown className="h-3 w-3 opacity-70" />
+                  </button>
+
+                  {openDropdown === "annotate" && (
+                    <div className="absolute left-0 top-full mt-1 w-44 rounded-lg border border-slate-200 bg-white py-1 shadow-xl z-50 text-xs">
+                      {(
+                        [
+                          { id: "highlight", label: "Highlight area" },
+                          { id: "strike", label: "Strikethrough" },
+                          { id: "underline", label: "Underline" },
+                          { id: "freehand", label: "Freehand Draw" },
+                        ] as const
+                      ).map((item) => (
+                        <button
+                          key={item.id}
+                          type="button"
+                          onClick={() => {
+                            setAnnotateSubTool(item.id);
+                            setActiveTool("annotate");
+                            setOpenDropdown(null);
+                          }}
+                          className="flex w-full items-center justify-between px-3 py-1.5 text-left text-slate-700 hover:bg-sky-50"
+                        >
+                          <span>{item.label}</span>
+                          {annotateSubTool === item.id && (
+                            <Check className="h-3.5 w-3.5 text-sky-600" />
+                          )}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* 8. SHAPES TOOL */}
+                <div className="relative flex items-center border-l border-sky-200">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setActiveTool("shapes");
+                      setOpenDropdown(openDropdown === "shapes" ? null : "shapes");
+                    }}
+                    className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium transition-colors ${
+                      activeTool === "shapes"
+                        ? "bg-sky-100/90 text-sky-800 font-semibold"
+                        : "text-sky-700 hover:bg-sky-50"
+                    }`}
+                  >
+                    <Shapes className="h-3.5 w-3.5 text-sky-600" />
+                    <span>Shapes</span>
+                    <ChevronDown className="h-3 w-3 opacity-70" />
+                  </button>
+
+                  {openDropdown === "shapes" && (
+                    <div className="absolute left-0 top-full mt-1 w-40 rounded-lg border border-slate-200 bg-white py-1 shadow-xl z-50 text-xs">
+                      {(
+                        [
+                          { id: "rect", label: "Rectangle", icon: Square },
+                          { id: "ellipse", label: "Ellipse / Circle", icon: Circle },
+                          { id: "line", label: "Straight Line", icon: Minus },
+                          { id: "arrow", label: "Arrow", icon: ArrowRight },
+                        ] as const
+                      ).map((item) => {
+                        const Icon = item.icon;
+                        return (
+                          <button
+                            key={item.id}
+                            type="button"
+                            onClick={() => {
+                              setShapeSubTool(item.id);
+                              setActiveTool("shapes");
+                              setOpenDropdown(null);
+                            }}
+                            className="flex w-full items-center justify-between px-3 py-1.5 text-left text-slate-700 hover:bg-sky-50"
+                          >
+                            <span className="flex items-center gap-2">
+                              <Icon className="h-3.5 w-3.5 text-sky-600" />
+                              {item.label}
+                            </span>
+                            {shapeSubTool === item.id && (
+                              <Check className="h-3.5 w-3.5 text-sky-600" />
+                            )}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+
+                {/* 9. UNDO / REDO */}
+                <button
+                  type="button"
+                  onClick={handleUndo}
+                  disabled={historyPast.length === 0}
+                  className="inline-flex items-center gap-1 border-l border-sky-200 px-3 py-1.5 text-xs font-medium text-sky-700 hover:bg-sky-50 disabled:opacity-40"
+                  title="Undo (Ctrl+Z)"
+                >
+                  <Undo2 className="h-3.5 w-3.5 text-sky-600" />
+                  <span>Undo</span>
+                </button>
+                {historyFuture.length > 0 && (
                   <button
                     type="button"
                     onClick={handleRedo}
-                    disabled={historyFuture.length === 0}
+                    className="inline-flex items-center gap-1 border-l border-sky-200 px-2.5 py-1.5 text-xs font-medium text-sky-700 hover:bg-sky-50"
                     title="Redo (Ctrl+Y)"
-                    className="rounded-lg p-1.5 text-slate-600 hover:bg-slate-100 dark:text-slate-300 disabled:opacity-30"
                   >
-                    <Redo2 className="h-3.5 w-3.5" />
+                    <Redo2 className="h-3.5 w-3.5 text-sky-600" />
+                  </button>
+                )}
+              </div>
+
+              {/* Optional Collapsible Find & Replace Bar */}
+              {showFindReplace && (
+                <div className="mt-2 flex flex-wrap items-center gap-2 rounded-lg border border-sky-200 bg-sky-50/70 px-3 py-1.5 text-xs shadow-2xs">
+                  <Search className="h-3.5 w-3.5 text-sky-600" />
+                  <input
+                    type="text"
+                    value={findText}
+                    onChange={(e) => setFindText(e.target.value)}
+                    placeholder="Find text..."
+                    className="rounded border border-slate-300 bg-white px-2 py-1 text-xs outline-none focus:border-sky-500"
+                  />
+                  <Replace className="h-3.5 w-3.5 text-sky-600" />
+                  <input
+                    type="text"
+                    value={replaceText}
+                    onChange={(e) => setReplaceText(e.target.value)}
+                    placeholder="Replace with..."
+                    className="rounded border border-slate-300 bg-white px-2 py-1 text-xs outline-none focus:border-sky-500"
+                  />
+                  <label className="inline-flex items-center gap-1 text-slate-600 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={matchCase}
+                      onChange={(e) => setMatchCase(e.target.checked)}
+                    />
+                    <span>Match case</span>
+                  </label>
+                  <button
+                    type="button"
+                    disabled={findMatches.length === 0}
+                    onClick={handleReplaceAll}
+                    className="rounded bg-sky-600 px-2.5 py-1 font-semibold text-white hover:bg-sky-500 disabled:opacity-40"
+                  >
+                    Replace All ({findMatches.length})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowFindReplace(false)}
+                    className="p-1 text-slate-400 hover:text-slate-600"
+                  >
+                    <X className="h-3.5 w-3.5" />
                   </button>
                 </div>
-
-                <button
-                  type="button"
-                  onClick={() => setShowFindReplace((v) => !v)}
-                  className={`inline-flex items-center gap-1 rounded-xl border px-2.5 py-1.5 text-xs font-semibold transition-colors ${
-                    showFindReplace
-                      ? "border-blue-600 bg-blue-50 text-blue-700 dark:bg-blue-950/50 dark:text-blue-300"
-                      : "border-slate-200 bg-white text-slate-700 hover:bg-slate-50 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-200"
-                  }`}
-                >
-                  <Search className="h-3.5 w-3.5 text-blue-600" />
-                  <span>Find & Replace</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={handleAddFreeText}
-                  className="inline-flex items-center gap-1 rounded-xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900 px-2.5 py-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-50"
-                >
-                  <Plus className="h-3.5 w-3.5 text-blue-600" />
-                  <span>+ Text</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={handleAddWhiteoutBox}
-                  className="inline-flex items-center gap-1 rounded-xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900 px-2.5 py-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-50"
-                >
-                  <Eraser className="h-3.5 w-3.5 text-blue-600" />
-                  <span>+ Whiteout</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => {
-                    setPreviewCleanMode((v) => !v);
-                    handleSelectBlock(null);
-                  }}
-                  className={`inline-flex items-center gap-1 rounded-xl border px-2.5 py-1.5 text-xs font-semibold transition-colors ${
-                    previewCleanMode
-                      ? "border-emerald-600 bg-emerald-50 text-emerald-700"
-                      : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-300"
-                  }`}
-                >
-                  {previewCleanMode ? (
-                    <EyeOff className="h-3.5 w-3.5 text-emerald-600" />
-                  ) : (
-                    <Eye className="h-3.5 w-3.5" />
-                  )}
-                  <span className="hidden sm:inline">Preview</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={handleSaveEditedPdf}
-                  disabled={isSaving}
-                  className="inline-flex items-center gap-1.5 rounded-xl bg-blue-600 hover:bg-blue-500 px-3.5 py-1.5 text-xs font-bold text-white shadow-sm disabled:opacity-50 transition-all"
-                >
-                  {isSaving ? (
-                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                  ) : (
-                    <Download className="h-3.5 w-3.5" />
-                  )}
-                  <span>
-                    Save PDF{modifiedBlocks.length > 0 ? ` (${modifiedBlocks.length})` : ""}
-                  </span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => {
-                    setFile(null);
-                    setTextBlocks([]);
-                    setWordTokensByPage({});
-                    handleSelectBlock(null);
-                  }}
-                  className="inline-flex items-center rounded-xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900 p-1.5 text-slate-500 hover:bg-slate-50"
-                  title="Close PDF"
-                >
-                  <Trash2 className="h-3.5 w-3.5" />
-                </button>
-              </div>
+              )}
             </div>
 
-            {/* Row 2: Constant-Height Microsoft Word Style Formatting Ribbon (Never jumps the page!) */}
-            <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs shadow-2xs dark:border-slate-800 dark:bg-slate-900">
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="font-bold text-slate-600 dark:text-slate-300 flex items-center gap-1">
-                  <Type className="h-3.5 w-3.5 text-blue-600" />
-                  <span>Font:</span>
-                </span>
-
-                {/* Font Family */}
-                <select
-                  disabled={!selectedBlock || Boolean(selectedBlock.isWhiteoutOnly)}
-                  value={selectedBlock ? selectedBlock.fontFamily : docDefaultFontRef.current}
-                  onChange={(e) =>
-                    selectedBlock &&
-                    handleUpdateBlock(selectedBlock.id, {
-                      fontFamily: e.target.value as PdfFontFamily,
-                    })
-                  }
-                  aria-label="Font Family"
-                  className="rounded border border-slate-200 bg-slate-50 px-2 py-1 text-xs font-medium text-slate-900 disabled:opacity-60 dark:border-slate-700 dark:bg-slate-800 dark:text-white"
+            {/* Right-Side Sejda Floating Page & Zoom Controls */}
+            <div className="fixed right-5 top-28 z-30 flex flex-col items-center gap-1.5">
+              <div className="flex flex-col items-center rounded-lg border border-sky-300 bg-white p-1 shadow-md text-xs text-sky-700">
+                <button
+                  type="button"
+                  onClick={() => setZoomPercent((z) => Math.min(175, z + 15))}
+                  className="p-1.5 hover:bg-sky-50 rounded"
+                  title="Zoom In"
                 >
-                  <option value="serif">Computer Modern / Times Serif</option>
-                  <option value="calibri">Calibri (Word Body)</option>
-                  <option value="sans">Arial / Helvetica</option>
-                  <option value="mono">Typewriter / Courier Mono</option>
-                </select>
-
-                {/* Font Size */}
-                <div className="flex items-center gap-1">
-                  <input
-                    type="number"
-                    step="0.5"
-                    min={6}
-                    max={72}
-                    disabled={!selectedBlock || Boolean(selectedBlock.isWhiteoutOnly)}
-                    value={selectedBlock ? selectedBlock.fontSizePt : 10}
-                    onChange={(e) =>
-                      selectedBlock &&
-                      handleUpdateBlock(selectedBlock.id, {
-                        fontSizePt: Math.max(6, Math.min(72, Number(e.target.value) || 10)),
-                      })
-                    }
-                    title="Font Size (pt)"
-                    className="w-14 rounded border border-slate-200 bg-slate-50 px-1.5 py-1 font-mono text-xs text-slate-900 disabled:opacity-60 dark:border-slate-700 dark:bg-slate-800 dark:text-white"
-                  />
-                  <span className="text-[11px] text-slate-400">pt</span>
-                </div>
-
-                {/* Bold & Italic */}
-                <div className="inline-flex items-center rounded border border-slate-200 bg-slate-50 dark:border-slate-700 dark:bg-slate-800 overflow-hidden">
-                  <button
-                    type="button"
-                    disabled={!selectedBlock || Boolean(selectedBlock.isWhiteoutOnly)}
-                    onClick={() =>
-                      selectedBlock &&
-                      handleUpdateBlock(selectedBlock.id, { isBold: !selectedBlock.isBold })
-                    }
-                    title="Bold"
-                    className={`px-2 py-1 font-bold disabled:opacity-40 ${
-                      selectedBlock?.isBold
-                        ? "bg-blue-600 text-white"
-                        : "text-slate-700 dark:text-slate-300 hover:bg-slate-200/60"
-                    }`}
-                  >
-                    <Bold className="h-3.5 w-3.5" />
-                  </button>
-                  <button
-                    type="button"
-                    disabled={!selectedBlock || Boolean(selectedBlock.isWhiteoutOnly)}
-                    onClick={() =>
-                      selectedBlock &&
-                      handleUpdateBlock(selectedBlock.id, { isItalic: !selectedBlock.isItalic })
-                    }
-                    title="Italic"
-                    className={`px-2 py-1 border-l border-slate-200 dark:border-slate-700 disabled:opacity-40 ${
-                      selectedBlock?.isItalic
-                        ? "bg-blue-600 text-white"
-                        : "text-slate-700 dark:text-slate-300 hover:bg-slate-200/60"
-                    }`}
-                  >
-                    <Italic className="h-3.5 w-3.5" />
-                  </button>
-                </div>
-
-                {/* Text Alignment */}
-                <div className="hidden sm:inline-flex items-center rounded border border-slate-200 bg-slate-50 dark:border-slate-700 dark:bg-slate-800 overflow-hidden">
-                  {(
-                    [
-                      { id: "left", icon: AlignLeft, label: "Align Left" },
-                      { id: "center", icon: AlignCenter, label: "Align Center" },
-                      { id: "right", icon: AlignRight, label: "Align Right" },
-                    ] as const
-                  ).map((al) => {
-                    const Icon = al.icon;
-                    return (
-                      <button
-                        key={al.id}
-                        type="button"
-                        disabled={!selectedBlock || Boolean(selectedBlock.isWhiteoutOnly)}
-                        onClick={() =>
-                          selectedBlock &&
-                          handleUpdateBlock(selectedBlock.id, { textAlign: al.id })
-                        }
-                        title={al.label}
-                        className={`px-1.5 py-1 disabled:opacity-40 ${
-                          selectedBlock?.textAlign === al.id
-                            ? "bg-blue-600 text-white"
-                            : "text-slate-700 dark:text-slate-300 hover:bg-slate-200/60"
-                        }`}
-                      >
-                        <Icon className="h-3.5 w-3.5" />
-                      </button>
-                    );
-                  })}
-                </div>
-
-                {/* Ink Color */}
-                <div className="flex items-center gap-1">
-                  <span className="text-slate-400 text-[11px]">Color:</span>
-                  <input
-                    type="color"
-                    disabled={!selectedBlock || Boolean(selectedBlock.isWhiteoutOnly)}
-                    value={selectedBlock ? selectedBlock.color : "#2e3138"}
-                    onChange={(e) =>
-                      selectedBlock &&
-                      handleUpdateBlock(selectedBlock.id, { color: e.target.value })
-                    }
-                    title="Text Ink Color (Auto-matched to original PDF text)"
-                    className="h-5 w-6 cursor-pointer rounded border border-slate-300 bg-white p-0 disabled:opacity-40"
-                  />
-                </div>
-
-                {/* Mask Mode */}
-                {selectedBlock && (
-                  <div className="flex items-center gap-1 border-l border-slate-200 pl-2 dark:border-slate-700">
-                    <span className="text-slate-400 text-[11px]">Paper:</span>
-                    {(
-                      [
-                        { id: "auto", label: "Auto" },
-                        { id: "white", label: "White" },
-                        { id: "black", label: "Redact" },
-                      ] as const
-                    ).map((m) => (
-                      <button
-                        key={m.id}
-                        type="button"
-                        onClick={() => handleUpdateBlock(selectedBlock.id, { maskBg: m.id })}
-                        className={`rounded border px-1.5 py-0.5 text-[10px] font-semibold ${
-                          selectedBlock.maskBg === m.id
-                            ? "border-blue-600 bg-blue-50 text-blue-700 font-bold"
-                            : "border-slate-200 bg-white text-slate-600"
-                        }`}
-                      >
-                        {m.label}
-                      </button>
-                    ))}
-                  </div>
-                )}
-
-                {/* Restore / Blank Out when a block is selected */}
-                {selectedBlock && (
-                  <div className="flex items-center gap-1.5 border-l border-slate-200 pl-2 dark:border-slate-700">
-                    {!selectedBlock.isNew && isBlockModified(selectedBlock) && (
-                      <button
-                        type="button"
-                        onClick={() => handleRestoreOriginalBlock(selectedBlock.id)}
-                        className="inline-flex items-center gap-1 rounded border border-slate-200 bg-slate-50 px-2 py-0.5 text-[11px] font-medium text-slate-700 hover:bg-slate-100"
-                      >
-                        <RotateCcw className="h-3 w-3" />
-                        <span>Reset</span>
-                      </button>
-                    )}
-                    <button
-                      type="button"
-                      onClick={() => handleDeleteOrClearBlock(selectedBlock)}
-                      className="inline-flex items-center gap-1 rounded border border-red-200 bg-red-50 px-2 py-0.5 text-[11px] font-semibold text-red-600 hover:bg-red-100"
-                    >
-                      <Trash2 className="h-3 w-3" />
-                      <span>{selectedBlock.isNew ? "Delete" : "Erase"}</span>
-                    </button>
-                  </div>
-                )}
+                  <ZoomIn className="h-4 w-4" />
+                </button>
+                <span className="font-mono text-[10px] font-bold py-0.5">
+                  {zoomPercent}%
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setZoomPercent((z) => Math.max(70, z - 15))}
+                  className="p-1.5 hover:bg-sky-50 rounded"
+                  title="Zoom Out"
+                >
+                  <ZoomOut className="h-4 w-4" />
+                </button>
               </div>
 
-              {/* Right Side of Ribbon: Zoom & Page Navigation */}
-              <div className="flex items-center gap-2 shrink-0">
-                <div className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-slate-50 px-1.5 py-0.5 dark:border-slate-800 dark:bg-slate-800">
+              {totalPages > 1 && (
+                <div className="flex flex-col items-center rounded-lg border border-sky-300 bg-white p-1 shadow-md text-xs text-sky-700">
                   <button
                     type="button"
-                    onClick={() => setZoomPercent((z) => Math.max(75, z - 25))}
-                    disabled={zoomPercent <= 75}
-                    title="Zoom Out"
-                    className="p-0.5 text-slate-600 hover:text-slate-900 disabled:opacity-30 dark:text-slate-300"
+                    disabled={currentPage <= 1}
+                    onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+                    className="p-1 hover:bg-sky-50 rounded disabled:opacity-30"
                   >
-                    <ZoomOut className="h-3.5 w-3.5" />
+                    <ChevronLeft className="h-4 w-4" />
                   </button>
-                  <span className="font-mono text-[11px] font-bold text-slate-800 dark:text-slate-200 min-w-[38px] text-center">
-                    {zoomPercent}%
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => setZoomPercent((z) => Math.min(200, z + 25))}
-                    disabled={zoomPercent >= 200}
-                    title="Zoom In"
-                    className="p-0.5 text-slate-600 hover:text-slate-900 disabled:opacity-30 dark:text-slate-300"
-                  >
-                    <ZoomIn className="h-3.5 w-3.5" />
-                  </button>
-                </div>
-
-                <div className="flex items-center gap-1">
-                  <button
-                    type="button"
-                    onClick={() => currentPage > 1 && setCurrentPage((p) => p - 1)}
-                    disabled={currentPage <= 1 || isRenderingPage}
-                    className="rounded border border-slate-200 p-1 text-slate-600 hover:bg-slate-100 disabled:opacity-30"
-                  >
-                    <ChevronLeft className="h-3.5 w-3.5" />
-                  </button>
-                  <span className="font-mono text-[11px] text-slate-900 dark:text-white font-bold px-1">
+                  <span className="font-mono text-[10px] font-bold px-1">
                     {currentPage}/{totalPages}
                   </span>
                   <button
                     type="button"
-                    onClick={() => currentPage < totalPages && setCurrentPage((p) => p + 1)}
-                    disabled={currentPage >= totalPages || isRenderingPage}
-                    className="rounded border border-slate-200 p-1 text-slate-600 hover:bg-slate-100 disabled:opacity-30"
+                    disabled={currentPage >= totalPages}
+                    onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
+                    className="p-1 hover:bg-sky-50 rounded disabled:opacity-30"
                   >
-                    <ChevronRight className="h-3.5 w-3.5" />
+                    <ChevronRight className="h-4 w-4" />
                   </button>
-                </div>
-              </div>
-            </div>
-
-            {/* Optional Collapsible Find & Replace Bar */}
-            {showFindReplace && (
-              <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-slate-200 bg-white p-2.5 text-xs shadow-2xs dark:border-slate-800 dark:bg-slate-900">
-                <div className="flex flex-wrap items-center gap-2 flex-1">
-                  <span className="font-bold text-slate-700 dark:text-slate-200 flex items-center gap-1">
-                    <Replace className="h-3.5 w-3.5 text-blue-600" />
-                    <span>Find & Replace:</span>
-                  </span>
-
-                  <div className="flex items-center gap-1.5 rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1 flex-1 min-w-[160px] dark:border-slate-700 dark:bg-slate-800">
-                    <Search className="h-3.5 w-3.5 text-slate-400 shrink-0" />
-                    <input
-                      type="text"
-                      value={findQuery}
-                      onChange={(e) => setFindQuery(e.target.value)}
-                      placeholder="Find text..."
-                      className="w-full bg-transparent text-xs text-slate-900 dark:text-white outline-none"
-                    />
-                    {findQuery && (
-                      <span className="rounded bg-blue-100 px-1.5 py-0.5 font-mono text-[10px] font-bold text-blue-700 shrink-0">
-                        {matchingBlocks.length}
-                      </span>
-                    )}
-                  </div>
-
-                  <div className="flex items-center gap-1.5 rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1 flex-1 min-w-[160px] dark:border-slate-700 dark:bg-slate-800">
-                    <Replace className="h-3.5 w-3.5 text-slate-400 shrink-0" />
-                    <input
-                      type="text"
-                      value={replaceQuery}
-                      onChange={(e) => setReplaceQuery(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter" && matchingBlocks.length > 0) {
-                          handleReplaceMatches("all");
-                        }
-                      }}
-                      placeholder="Replace with..."
-                      className="w-full bg-transparent text-xs text-slate-900 dark:text-white outline-none"
-                    />
-                  </div>
-
-                  <label className="inline-flex items-center gap-1 text-slate-600 dark:text-slate-400 cursor-pointer select-none px-1">
-                    <input
-                      type="checkbox"
-                      checked={caseSensitiveFind}
-                      onChange={(e) => setCaseSensitiveFind(e.target.checked)}
-                      className="rounded border-slate-300 text-blue-600"
-                    />
-                    <span>Match case</span>
-                  </label>
-                </div>
-
-                <div className="flex items-center gap-1.5">
-                  <button
-                    type="button"
-                    disabled={matchingBlocks.length === 0}
-                    onClick={() => handleReplaceMatches("page")}
-                    className="rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1 font-semibold text-slate-700 hover:bg-slate-100 disabled:opacity-40"
-                  >
-                    Replace Page
-                  </button>
-                  <button
-                    type="button"
-                    disabled={matchingBlocks.length === 0}
-                    onClick={() => handleReplaceMatches("all")}
-                    className="rounded-lg bg-blue-600 px-3 py-1 font-bold text-white hover:bg-blue-500 disabled:opacity-40"
-                  >
-                    Replace All
-                  </button>
-                </div>
-              </div>
-            )}
-
-            {/* Scanned / Image-Only PDF Detection Banner */}
-            {!isRenderingPage && currentPageBlocks.filter((b) => !b.isNew).length === 0 && (
-              <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-200 bg-amber-50/90 px-4 py-2.5 text-xs text-amber-900">
-                <div className="flex items-center gap-2">
-                  <ScanText className="h-4 w-4 text-amber-600 shrink-0" />
-                  <span>
-                    <strong>Scanned image PDF detected on Page {currentPage}.</strong> Use{" "}
-                    <strong>+ Whiteout</strong> and <strong>+ Text</strong> above, or run OCR first.
-                  </span>
-                </div>
-                <Link
-                  href="/tools/ocr-pdf"
-                  className="inline-flex items-center gap-1 rounded-lg bg-amber-600 px-3 py-1 font-bold text-white hover:bg-amber-500 shrink-0"
-                >
-                  <span>Open OCR Tool →</span>
-                </Link>
-              </div>
-            )}
-
-            {/* Word-Document Style Page Canvas */}
-            <div
-              onPointerDown={handleViewportPointerDown}
-              className="relative block overflow-auto rounded-2xl border border-slate-200 bg-slate-200/70 p-4 sm:p-6 max-h-[82vh] cursor-text dark:border-slate-800 dark:bg-slate-950"
-            >
-              {isRenderingPage && (
-                <div className="absolute inset-0 z-30 flex items-center justify-center bg-white/60 dark:bg-slate-950/60 backdrop-blur-2xs">
-                  <Loader2 className="h-6 w-6 animate-spin text-blue-600" />
                 </div>
               )}
 
-              <div
-                ref={pageContainerRef}
-                style={{
-                  width: `${Math.round(pageBaseSizePt.width * 1.35 * (zoomPercent / 100))}px`,
-                  maxWidth: zoomPercent > 100 ? "none" : "100%",
+              <button
+                type="button"
+                onClick={() => {
+                  setFile(null);
+                  setLines([]);
+                  setOverlays([]);
                 }}
-                className="relative mx-auto block h-fit select-none shadow-2xl border border-slate-300/80 bg-white leading-none antialiased"
+                className="rounded-lg border border-slate-300 bg-white p-2 text-slate-500 hover:text-red-600 shadow-md"
+                title="Close PDF"
               >
-                <canvas ref={pdfCanvasRef} className="block w-full h-auto" />
+                <Trash2 className="h-4 w-4" />
+              </button>
+            </div>
 
-                {/* Live Drag-Select Marquee Rectangle */}
-                {marqueeRect &&
-                  (Math.abs(marqueeRect.curX - marqueeRect.startX) > 1.2 ||
-                    Math.abs(marqueeRect.curY - marqueeRect.startY) > 1.0) && (
-                    <div
-                      style={{
-                        left: `${Math.min(marqueeRect.startX, marqueeRect.curX)}%`,
-                        top: `${Math.min(marqueeRect.startY, marqueeRect.curY)}%`,
-                        width: `${Math.abs(marqueeRect.curX - marqueeRect.startX)}%`,
-                        height: `${Math.abs(marqueeRect.curY - marqueeRect.startY)}%`,
-                      }}
-                      className="pointer-events-none absolute z-40 border border-blue-600 bg-blue-500/15"
-                    />
-                  )}
+            {/* ================================================================ */}
+            {/* MAIN SEJDA PAGE WORKSPACE (CLEAN CANVAS + LIVE DOM TEXT LAYER)   */}
+            {/* ================================================================ */}
+            <div className="w-full flex-1 overflow-auto py-6 px-4 flex justify-center">
+              <div
+                ref={pageWrapperRef}
+                onPointerDown={handlePagePointerDown}
+                style={{
+                  width: `${pageCssWidth}px`,
+                  height: `${pageCssHeight}px`,
+                }}
+                className={`relative bg-white shadow-[0_4px_24px_rgba(0,0,0,0.12)] select-none ${
+                  activeTool === "text" ? "cursor-text" : "cursor-crosshair"
+                }`}
+              >
+                {isRenderingPage && (
+                  <div className="absolute inset-0 z-50 flex items-center justify-center bg-white/70">
+                    <Loader2 className="h-7 w-7 animate-spin text-sky-600" />
+                  </div>
+                )}
 
-                {currentPageBlocks.map((block) => {
-                  const isSelected = !previewCleanMode && selectedBlockId === block.id;
-                  const isModified = isBlockModified(block);
-                  const reflow = pageReflowMap.get(block.id);
-                  const effectiveXPct = reflow?.effectiveXPercent ?? block.xPercent;
-                  const isFindHit =
-                    findQuery.trim().length > 0 &&
-                    !block.isWhiteoutOnly &&
-                    (caseSensitiveFind
-                      ? block.currentText.includes(findQuery)
-                      : block.currentText.toLowerCase().includes(findQuery.toLowerCase()));
+                {/* Clean Text-Free PDF Background Canvas */}
+                <canvas
+                  ref={bgCanvasRef}
+                  className="pointer-events-none block w-full h-full"
+                />
 
-                  if (previewCleanMode) {
-                    return null;
-                  }
+                {/* Live Drag-Draw Preview Box */}
+                {dragState?.kind === "draw-box" && (
+                  <div
+                    style={{
+                      left: `${Math.min(dragState.startXPt, dragState.curXPt) * displayScale}px`,
+                      top: `${Math.min(dragState.startYPt, dragState.curYPt) * displayScale}px`,
+                      width: `${Math.abs(dragState.curXPt - dragState.startXPt) * displayScale}px`,
+                      height: `${Math.abs(dragState.curYPt - dragState.startYPt) * displayScale}px`,
+                    }}
+                    className="pointer-events-none absolute z-40 border border-sky-500 bg-sky-400/15"
+                  />
+                )}
 
-                  const maskHex = resolveMaskHex(block);
-                  const scaledFontPx = Math.max(8, block.fontSizePt * displayScale);
-                  const scaledLineHeightPx =
-                    (block.lineHeightPt || block.fontSizePt * 1.3) * displayScale;
+                {/* ============================================================ */}
+                {/* OVERLAY ITEMS (Whiteouts, Highlights, Shapes, Forms, Images) */}
+                {/* ============================================================ */}
+                {currentPageOverlays.map((ov) => {
+                  const isSel = selectedId === ov.id;
+                  const leftPx = ov.xPt * displayScale;
+                  const topPx = ov.yPt * displayScale;
+                  const widthPx = ov.wPt * displayScale;
+                  const heightPx = ov.hPt * displayScale;
 
                   return (
                     <div
-                      key={block.id}
+                      key={ov.id}
                       onClick={(e) => {
                         e.stopPropagation();
-                        handleSelectBlock(block);
+                        setSelectedId(ov.id);
                       }}
                       onPointerDown={(e) => {
-                        if (block.isWhiteoutOnly || isSelected) {
-                          e.stopPropagation();
-                          if (block.isWhiteoutOnly) {
-                            handleStartInteraction(block, "drag", e);
+                        e.stopPropagation();
+                        setSelectedId(ov.id);
+                        setDragState({
+                          kind: "move-overlay",
+                          targetId: ov.id,
+                          startClientX: e.clientX,
+                          startClientY: e.clientY,
+                          startXPt: ov.xPt,
+                          startYPt: ov.yPt,
+                          startWPt: ov.wPt,
+                          startHPt: ov.hPt,
+                          curXPt: ov.xPt,
+                          curYPt: ov.yPt,
+                          snapshotBefore: { lines, overlays },
+                        });
+                      }}
+                      style={{
+                        left: `${leftPx}px`,
+                        top: `${topPx}px`,
+                        width: `${widthPx}px`,
+                        height: `${heightPx}px`,
+                      }}
+                      className={`group absolute cursor-move ${
+                        isSel
+                          ? "z-30 ring-1 ring-sky-500"
+                          : "z-20 hover:ring-1 hover:ring-sky-400/60"
+                      }`}
+                    >
+                      {/* Floating Mini-Toolbar for Selected Overlay */}
+                      {isSel && (
+                        <div
+                          onPointerDown={(e) => e.stopPropagation()}
+                          onClick={(e) => e.stopPropagation()}
+                          className="absolute -top-9 left-0 z-50 flex items-center rounded-md border border-sky-400 bg-white shadow-md text-xs text-sky-700"
+                        >
+                          {ov.kind === "link" && (
+                            <input
+                              type="text"
+                              value={ov.linkUrl || ""}
+                              onChange={(e) =>
+                                updateOverlay(ov.id, { linkUrl: e.target.value })
+                              }
+                              placeholder="https://example.com"
+                              className="w-40 px-2 py-1 text-xs text-slate-800 outline-none"
+                            />
+                          )}
+                          <input
+                            type="color"
+                            value={ov.color || "#2563eb"}
+                            onChange={(e) =>
+                              updateOverlay(ov.id, { color: e.target.value })
+                            }
+                            className="h-6 w-6 cursor-pointer border-0 bg-transparent p-0.5"
+                            title="Color"
+                          />
+                          <button
+                            type="button"
+                            onClick={handleDuplicateSelected}
+                            className="border-l border-sky-200 px-2 py-1 hover:bg-sky-50"
+                            title="Duplicate"
+                          >
+                            <Copy className="h-3.5 w-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={handleDeleteSelected}
+                            className="border-l border-sky-200 px-2 py-1 text-red-600 hover:bg-red-50"
+                            title="Delete"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </button>
+                        </div>
+                      )}
+
+                      {ov.kind === "whiteout" && (
+                        <div
+                          style={{ backgroundColor: ov.fillColor || "#ffffff" }}
+                          className="w-full h-full border border-dashed border-slate-300/60"
+                        />
+                      )}
+                      {ov.kind === "highlight" && (
+                        <div
+                          style={{ backgroundColor: ov.color || "#facc15" }}
+                          className="w-full h-full opacity-40"
+                        />
+                      )}
+                      {ov.kind === "link" && (
+                        <div className="w-full h-full border border-sky-500/70 bg-sky-400/15 flex items-center justify-center">
+                          <LinkIcon className="h-3.5 w-3.5 text-sky-600 opacity-70" />
+                        </div>
+                      )}
+                      {ov.kind === "strike" && (
+                        <div className="w-full h-full flex items-center">
+                          <div
+                            style={{ backgroundColor: ov.color || "#dc2626" }}
+                            className="w-full h-[2px]"
+                          />
+                        </div>
+                      )}
+                      {ov.kind === "underline" && (
+                        <div className="w-full h-full flex items-end">
+                          <div
+                            style={{ backgroundColor: ov.color || "#2563eb" }}
+                            className="w-full h-[2px]"
+                          />
+                        </div>
+                      )}
+                      {ov.kind === "rect" && (
+                        <div
+                          style={{ borderColor: ov.color, borderWidth: "2px" }}
+                          className="w-full h-full"
+                        />
+                      )}
+                      {ov.kind === "ellipse" && (
+                        <div
+                          style={{ borderColor: ov.color, borderWidth: "2px" }}
+                          className="w-full h-full rounded-full"
+                        />
+                      )}
+                      {(ov.kind === "line" || ov.kind === "arrow") && (
+                        <div className="w-full h-full flex items-center">
+                          <div
+                            style={{ backgroundColor: ov.color }}
+                            className="w-full h-[2px]"
+                          />
+                        </div>
+                      )}
+                      {(ov.kind === "check" ||
+                        ov.kind === "cross" ||
+                        ov.kind === "dot") && (
+                        <div
+                          style={{
+                            color: ov.color,
+                            fontSize: `${14 * displayScale}px`,
+                          }}
+                          className="font-bold leading-none select-none"
+                        >
+                          {ov.text}
+                        </div>
+                      )}
+                      {ov.kind === "textfield" && (
+                        <input
+                          type="text"
+                          value={ov.text || ""}
+                          onChange={(e) =>
+                            updateOverlay(ov.id, { text: e.target.value })
                           }
+                          onPointerDown={(e) => e.stopPropagation()}
+                          style={{
+                            fontSize: `${11 * displayScale}px`,
+                            color: ov.color,
+                          }}
+                          className="w-full h-full border border-sky-400 bg-sky-50/40 px-1 outline-none"
+                        />
+                      )}
+                      {(ov.kind === "image" || ov.kind === "signature") &&
+                        ov.dataUrl && (
+                          <img
+                            src={ov.dataUrl}
+                            alt={ov.kind}
+                            draggable={false}
+                            className="w-full h-full object-contain pointer-events-none"
+                          />
+                        )}
+
+                      {/* Corner Resize Handle */}
+                      {isSel && (
+                        <div
+                          onPointerDown={(e) => {
+                            e.stopPropagation();
+                            setDragState({
+                              kind: "resize-overlay",
+                              targetId: ov.id,
+                              startClientX: e.clientX,
+                              startClientY: e.clientY,
+                              startXPt: ov.xPt,
+                              startYPt: ov.yPt,
+                              startWPt: ov.wPt,
+                              startHPt: ov.hPt,
+                              curXPt: ov.xPt,
+                              curYPt: ov.yPt,
+                              snapshotBefore: { lines, overlays },
+                            });
+                          }}
+                          className="absolute -bottom-1.5 -right-1.5 h-3 w-3 rounded-xs border border-white bg-sky-600 cursor-nwse-resize"
+                        />
+                      )}
+                    </div>
+                  );
+                })}
+
+                {/* ============================================================ */}
+                {/* MODULE 1 & 2: FULL-PAGE LIVE DOM TEXT LINES + MINI-TOOLBAR   */}
+                {/* ============================================================ */}
+                {currentPageLines.map((ln) => {
+                  const isSelected = selectedId === ln.id;
+                  const isFindHit =
+                    findText.trim().length > 0 &&
+                    (matchCase
+                      ? ln.text.includes(findText)
+                      : ln.text.toLowerCase().includes(findText.toLowerCase()));
+
+                  const leftPx = ln.xPt * displayScale;
+                  const topPx = ln.yPt * displayScale;
+                  const minWidthPx = Math.max(24, ln.widthPt * displayScale);
+                  const fontPx = ln.fontSizePt * displayScale;
+
+                  return (
+                    <div
+                      key={ln.id}
+                      onPointerDown={(e) => {
+                        if (activeTool !== "text") return;
+                        e.stopPropagation();
+                      }}
+                      onClick={(e) => {
+                        if (activeTool !== "text") return;
+                        e.stopPropagation();
+                        if (selectedId !== ln.id) {
+                          setSelectedId(ln.id);
+                          setOpenDropdown(null);
                         }
                       }}
                       style={{
-                        left: `${effectiveXPct}%`,
-                        top: `${block.yPercent}%`,
-                        minWidth: `${block.widthPercent}%`,
-                        minHeight: `${block.heightPercent}%`,
-                        backgroundColor: isSelected
-                          ? maskHex === "transparent"
-                            ? "#ffffff"
-                            : maskHex
-                          : "transparent",
-                        justifyContent:
-                          block.textAlign === "center"
-                            ? "center"
-                            : block.textAlign === "right"
-                              ? "flex-end"
-                              : "flex-start",
+                        left: `${leftPx}px`,
+                        top: `${topPx}px`,
+                        minWidth: `${minWidthPx}px`,
                       }}
-                      className={`group absolute flex items-start rounded-[1px] transition-colors ${
+                      className={`group absolute flex items-center rounded-[2px] transition-shadow ${
                         isSelected
-                          ? "z-30 ring-1 ring-blue-500/60"
+                          ? "z-30 ring-1 ring-sky-400/90 bg-sky-50/10"
                           : isFindHit
-                            ? "z-25 bg-amber-300/25 ring-1 ring-amber-500/70"
-                            : "z-10 hover:bg-blue-500/[0.06] cursor-text"
+                            ? "z-25 bg-amber-300/40 ring-1 ring-amber-500"
+                            : activeTool === "text"
+                              ? "z-10 hover:ring-1 hover:ring-sky-300/80"
+                              : "z-10 pointer-events-none"
                       }`}
                     >
-                      {/* Unobtrusive left drag handle & corner resize handle only when selected */}
+                      {/* ====================================================== */}
+                      {/* MODULE 2: SEJDA FLOATING CONTEXT MINI-TOOLBAR          */}
+                      {/* [ B | I | T↕▾ | Aa▾ | 🎨▾ | 🔗 | ✥ | ❐ | 🗑 ]          */}
+                      {/* ====================================================== */}
                       {isSelected && (
-                        <>
+                        <div
+                          onPointerDown={(e) => e.stopPropagation()}
+                          onClick={(e) => e.stopPropagation()}
+                          className="absolute -top-9 left-0 z-50 flex items-center rounded-[5px] border border-sky-400/90 bg-white shadow-md text-xs text-sky-700 select-none whitespace-nowrap"
+                        >
+                          {/* Bold */}
                           <button
                             type="button"
-                            onPointerDown={(e) => handleStartInteraction(block, "drag", e)}
-                            title="Drag to move"
-                            className="absolute -left-4 top-0 z-40 flex h-4 w-3.5 items-center justify-center rounded-l bg-blue-600 text-white opacity-75 hover:opacity-100 cursor-move"
+                            onClick={() =>
+                              updateLine(ln.id, { isBold: !ln.isBold })
+                            }
+                            className={`px-2.5 py-1.5 font-serif font-bold transition-colors ${
+                              ln.isBold
+                                ? "bg-sky-100 text-sky-900"
+                                : "hover:bg-sky-50"
+                            }`}
+                            title="Bold"
                           >
-                            <Move className="h-2.5 w-2.5" />
+                            B
                           </button>
 
-                          <div
-                            onPointerDown={(e) => handleStartInteraction(block, "resize", e)}
-                            title="Resize"
-                            className="absolute -bottom-1 -right-1 z-40 h-2.5 w-2.5 border border-white bg-blue-600 cursor-nwse-resize"
-                          />
-                        </>
-                      )}
-
-                      {block.isWhiteoutOnly ? (
-                        <div className="w-full h-full min-h-[14px] cursor-move" />
-                      ) : isSelected && block.isMultiline ? (
-                        <textarea
-                          autoFocus
-                          rows={Math.max(2, block.currentText.split("\n").length)}
-                          value={block.currentText}
-                          onChange={(e) => {
-                            handleUpdateBlock(block.id, { currentText: e.target.value });
-                          }}
-                          style={{
-                            color: block.color,
-                            fontFamily: FONT_CSS_MAP[block.fontFamily],
-                            fontWeight: block.isBold ? 700 : 400,
-                            fontStyle: block.isItalic ? "italic" : "normal",
-                            fontSize: `${scaledFontPx}px`,
-                            lineHeight: `${scaledLineHeightPx}px`,
-                            textAlign: block.textAlign,
-                          }}
-                          className="w-full min-w-full bg-transparent outline-none p-0 m-0 resize-none antialiased selection:bg-blue-500/20"
-                        />
-                      ) : isSelected ? (
-                        /* Seamless Word-like inline input that expands naturally as you type */
-                        <div className="inline-grid w-full items-center">
-                          <span
-                            aria-hidden="true"
-                            style={{
-                              fontFamily: FONT_CSS_MAP[block.fontFamily],
-                              fontWeight: block.isBold ? 700 : 400,
-                              fontStyle: block.isItalic ? "italic" : "normal",
-                              fontSize: `${scaledFontPx}px`,
-                            }}
-                            className="invisible col-start-1 row-start-1 whitespace-pre pr-2 pointer-events-none select-none leading-none"
+                          {/* Italic */}
+                          <button
+                            type="button"
+                            onClick={() =>
+                              updateLine(ln.id, { isItalic: !ln.isItalic })
+                            }
+                            className={`border-l border-sky-200 px-2.5 py-1.5 font-serif italic transition-colors ${
+                              ln.isItalic
+                                ? "bg-sky-100 text-sky-900"
+                                : "hover:bg-sky-50"
+                            }`}
+                            title="Italic"
                           >
-                            {block.currentText || " "}
-                          </span>
-                          <input
-                            type="text"
-                            autoFocus
-                            value={block.currentText}
-                            onChange={(e) => {
-                              handleUpdateBlock(block.id, { currentText: e.target.value });
-                            }}
-                            onKeyDown={(e) => {
-                              if (e.key === "Enter") {
-                                e.preventDefault();
-                                handleNavigateLine("down");
-                              } else if (e.key === "ArrowDown") {
-                                e.preventDefault();
-                                handleNavigateLine("down");
-                              } else if (e.key === "ArrowUp") {
-                                e.preventDefault();
-                                handleNavigateLine("up");
+                            I
+                          </button>
+
+                          {/* Font Size (T↕ ▾) */}
+                          <div className="relative border-l border-sky-200">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setOpenDropdown(
+                                  openDropdown === "line-size" ? null : "line-size"
+                                )
+                              }
+                              className="inline-flex items-center gap-0.5 px-2 py-1.5 hover:bg-sky-50 font-medium"
+                              title="Font size"
+                            >
+                              <span>T↕</span>
+                              <ChevronDown className="h-3 w-3 opacity-70" />
+                            </button>
+                            {openDropdown === "line-size" && (
+                              <div className="absolute left-0 top-full mt-1 flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white p-2 shadow-xl z-50">
+                                <input
+                                  type="number"
+                                  min={6}
+                                  max={72}
+                                  step={0.5}
+                                  value={ln.fontSizePt}
+                                  onChange={(e) =>
+                                    updateLine(ln.id, {
+                                      fontSizePt: Math.max(
+                                        6,
+                                        Math.min(72, Number(e.target.value) || 11)
+                                      ),
+                                    })
+                                  }
+                                  className="w-16 rounded border border-slate-300 px-1.5 py-1 font-mono text-xs text-slate-900"
+                                />
+                                <span className="text-[11px] text-slate-500">pt</span>
+                              </div>
+                            )}
+                          </div>
+
+                          {/* Font Family (Aa ▾) */}
+                          <div className="relative border-l border-sky-200">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setOpenDropdown(
+                                  openDropdown === "line-font" ? null : "line-font"
+                                )
+                              }
+                              className="inline-flex items-center gap-0.5 px-2 py-1.5 hover:bg-sky-50 font-medium"
+                              title="Font family"
+                            >
+                              <span>Aa</span>
+                              <ChevronDown className="h-3 w-3 opacity-70" />
+                            </button>
+                            {openDropdown === "line-font" && (
+                              <div className="absolute left-0 top-full mt-1 w-52 rounded-lg border border-slate-200 bg-white py-1 shadow-xl z-50">
+                                {EDITOR_FONTS.map((f) => (
+                                  <button
+                                    key={f.id}
+                                    type="button"
+                                    style={{ fontFamily: f.css }}
+                                    onClick={() => {
+                                      updateLine(ln.id, { fontId: f.id });
+                                      setOpenDropdown(null);
+                                    }}
+                                    className="flex w-full items-center justify-between px-3 py-1.5 text-left text-xs text-slate-800 hover:bg-sky-50"
+                                  >
+                                    <span>{f.label}</span>
+                                    {ln.fontId === f.id && (
+                                      <Check className="h-3.5 w-3.5 text-sky-600" />
+                                    )}
+                                  </button>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+
+                          {/* Color Swatch (🎨 ▾) */}
+                          <div className="relative border-l border-sky-200">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setOpenDropdown(
+                                  openDropdown === "line-color"
+                                    ? null
+                                    : "line-color"
+                                )
+                              }
+                              className="inline-flex items-center gap-1 px-2 py-1.5 hover:bg-sky-50"
+                              title="Text color"
+                            >
+                              <Palette className="h-3.5 w-3.5" />
+                              <ChevronDown className="h-3 w-3 opacity-70" />
+                            </button>
+                            {openDropdown === "line-color" && (
+                              <div className="absolute left-0 top-full mt-1 flex items-center gap-1 rounded-lg border border-slate-200 bg-white p-2 shadow-xl z-50">
+                                {PRESET_COLORS.map((hex) => (
+                                  <button
+                                    key={hex}
+                                    type="button"
+                                    onClick={() => {
+                                      updateLine(ln.id, { color: hex });
+                                      setOpenDropdown(null);
+                                    }}
+                                    style={{ backgroundColor: hex }}
+                                    className="h-5 w-5 rounded-full border border-slate-300"
+                                  />
+                                ))}
+                                <input
+                                  type="color"
+                                  value={ln.color}
+                                  onChange={(e) =>
+                                    updateLine(ln.id, { color: e.target.value })
+                                  }
+                                  className="h-5 w-5 cursor-pointer border-0 bg-transparent p-0"
+                                />
+                              </div>
+                            )}
+                          </div>
+
+                          {/* Link (🔗) */}
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const url = window.prompt(
+                                "Enter URL for this text:",
+                                ln.linkUrl || "https://"
+                              );
+                              if (url !== null) {
+                                updateLine(ln.id, { linkUrl: url });
                               }
                             }}
-                            style={{
-                              color: block.color,
-                              fontFamily: FONT_CSS_MAP[block.fontFamily],
-                              fontWeight: block.isBold ? 700 : 400,
-                              fontStyle: block.isItalic ? "italic" : "normal",
-                              fontSize: `${scaledFontPx}px`,
-                              textAlign: block.textAlign,
+                            className="border-l border-sky-200 px-2 py-1.5 hover:bg-sky-50"
+                            title="Add link"
+                          >
+                            <LinkIcon className="h-3.5 w-3.5" />
+                          </button>
+
+                          {/* Move Handle (✥) */}
+                          <button
+                            type="button"
+                            onPointerDown={(e) => {
+                              e.stopPropagation();
+                              setDragState({
+                                kind: "move-line",
+                                targetId: ln.id,
+                                startClientX: e.clientX,
+                                startClientY: e.clientY,
+                                startXPt: ln.xPt,
+                                startYPt: ln.yPt,
+                                startWPt: ln.widthPt,
+                                startHPt: ln.heightPt,
+                                curXPt: ln.xPt,
+                                curYPt: ln.yPt,
+                                snapshotBefore: { lines, overlays },
+                              });
                             }}
-                            className="col-start-1 row-start-1 w-full min-w-full bg-transparent outline-none leading-none p-0 m-0 antialiased selection:bg-blue-500/20"
-                          />
+                            className="border-l border-sky-200 px-2 py-1.5 hover:bg-sky-50 cursor-move"
+                            title="Drag to move text line"
+                          >
+                            <Move className="h-3.5 w-3.5" />
+                          </button>
+
+                          {/* Duplicate (❐) */}
+                          <button
+                            type="button"
+                            onClick={handleDuplicateSelected}
+                            className="border-l border-sky-200 px-2 py-1.5 hover:bg-sky-50"
+                            title="Duplicate text"
+                          >
+                            <Copy className="h-3.5 w-3.5" />
+                          </button>
+
+                          {/* Delete (🗑) */}
+                          <button
+                            type="button"
+                            onClick={handleDeleteSelected}
+                            className="border-l border-sky-200 px-2 py-1.5 text-red-600 hover:bg-red-50"
+                            title="Delete text line"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </button>
                         </div>
-                      ) : isModified ? (
-                        /* Invisible sizer keeps the hit-box matching the edited text width with zero visible border clutter */
+                      )}
+
+                      {/* Live Auto-Expanding In-Place Text Input (100% Unified Rendering!) */}
+                      <div className="inline-grid items-center">
                         <span
                           aria-hidden="true"
                           style={{
-                            fontFamily: FONT_CSS_MAP[block.fontFamily],
-                            fontWeight: block.isBold ? 700 : 400,
-                            fontStyle: block.isItalic ? "italic" : "normal",
-                            fontSize: `${scaledFontPx}px`,
+                            fontFamily: getFontCss(ln.fontId),
+                            fontSize: `${fontPx}px`,
+                            fontWeight: ln.isBold ? 700 : 400,
+                            fontStyle: ln.isItalic ? "italic" : "normal",
+                            lineHeight: 1.15,
                           }}
-                          className="invisible whitespace-pre pr-1 pointer-events-none select-none leading-none"
+                          className="invisible col-start-1 row-start-1 whitespace-pre pr-1 pointer-events-none select-none"
                         >
-                          {block.currentText.split("\n")[0] || " "}
+                          {ln.text || " "}
                         </span>
-                      ) : null}
+                        <input
+                          type="text"
+                          spellCheck={false}
+                          value={ln.text}
+                          onFocus={() => {
+                            if (selectedId !== ln.id) {
+                              setSelectedId(ln.id);
+                            }
+                            if (ln.isNew && ln.text === "Type your text") {
+                              updateLine(ln.id, { text: "" }, false);
+                            }
+                          }}
+                          onChange={(e) =>
+                            updateLine(ln.id, { text: e.target.value })
+                          }
+                          style={{
+                            fontFamily: getFontCss(ln.fontId),
+                            fontSize: `${fontPx}px`,
+                            fontWeight: ln.isBold ? 700 : 400,
+                            fontStyle: ln.isItalic ? "italic" : "normal",
+                            color: ln.color,
+                            lineHeight: 1.15,
+                            WebkitFontSmoothing: "antialiased",
+                          }}
+                          className="col-start-1 row-start-1 w-full min-w-full bg-transparent p-0 m-0 outline-none border-0 selection:bg-sky-500/25"
+                        />
+                      </div>
                     </div>
                   );
                 })}
               </div>
             </div>
 
-            {errorMessage && (
-              <div className="flex items-start gap-2.5 rounded-xl border border-red-200 bg-red-50 p-3 text-xs text-red-700">
-                <AlertCircle className="h-4 w-4 shrink-0 text-red-600 mt-0.5" />
-                <span>{errorMessage}</span>
+            {/* ================================================================ */}
+            {/* MODULE 4: SEJDA STICKY BOTTOM "APPLY CHANGES >" BAR              */}
+            {/* ================================================================ */}
+            <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-40 flex items-center gap-3 rounded-2xl bg-[#fde6cc]/95 dark:bg-slate-900/95 p-2 shadow-xl border border-amber-200/80">
+              <button
+                type="button"
+                onClick={handleApplyChanges}
+                disabled={isApplying}
+                className="inline-flex items-center gap-2 rounded-lg bg-[#00b050] hover:bg-[#009a46] px-6 py-2.5 text-sm font-bold text-white shadow-sm transition-all disabled:opacity-50 cursor-pointer"
+              >
+                {isApplying ? (
+                  <>
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    <span>Processing PDF...</span>
+                  </>
+                ) : (
+                  <>
+                    <span>Apply changes</span>
+                    <ChevronRight className="h-4 w-4" />
+                  </>
+                )}
+              </button>
+
+              {readyDownloadBlob && (
+                <button
+                  type="button"
+                  onClick={() =>
+                    downloadBlob(readyDownloadBlob.bytes, readyDownloadBlob.name)
+                  }
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 px-4 py-2.5 text-xs font-bold text-white shadow-sm"
+                >
+                  <Download className="h-3.5 w-3.5" />
+                  <span>Download ({readyDownloadBlob.name})</span>
+                </button>
+              )}
+            </div>
+
+            {/* ================================================================ */}
+            {/* SIGNATURE PAD MODAL (DRAW OR TYPE CURSIVE SIGNATURE)             */}
+            {/* ================================================================ */}
+            {showSignModal && (
+              <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4 backdrop-blur-2xs">
+                <div className="w-full max-w-md rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl space-y-4">
+                  <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+                    <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+                      <PenTool className="h-4 w-4 text-sky-600" />
+                      <span>Create Signature</span>
+                    </h3>
+                    <button
+                      type="button"
+                      onClick={() => setShowSignModal(false)}
+                      className="rounded p-1 text-slate-400 hover:bg-slate-100"
+                    >
+                      <X className="h-4 w-4" />
+                    </button>
+                  </div>
+
+                  <div className="flex gap-2 text-xs">
+                    <button
+                      type="button"
+                      onClick={() => setSignMode("draw")}
+                      className={`flex-1 rounded-lg py-1.5 font-semibold ${
+                        signMode === "draw"
+                          ? "bg-sky-600 text-white"
+                          : "bg-slate-100 text-slate-700"
+                      }`}
+                    >
+                      Draw Signature
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setSignMode("type")}
+                      className={`flex-1 rounded-lg py-1.5 font-semibold ${
+                        signMode === "type"
+                          ? "bg-sky-600 text-white"
+                          : "bg-slate-100 text-slate-700"
+                      }`}
+                    >
+                      Type Signature
+                    </button>
+                  </div>
+
+                  {signMode === "draw" ? (
+                    <div className="space-y-2">
+                      <canvas
+                        ref={signPadCanvasRef}
+                        width={400}
+                        height={140}
+                        onPointerDown={(e) => {
+                          const c = signPadCanvasRef.current;
+                          if (!c) return;
+                          isDrawingSignRef.current = true;
+                          const r = c.getBoundingClientRect();
+                          const ctx = c.getContext("2d")!;
+                          ctx.strokeStyle = signColor;
+                          ctx.lineWidth = 2.8;
+                          ctx.lineCap = "round";
+                          ctx.beginPath();
+                          ctx.moveTo(e.clientX - r.left, e.clientY - r.top);
+                        }}
+                        onPointerMove={(e) => {
+                          if (!isDrawingSignRef.current || !signPadCanvasRef.current)
+                            return;
+                          const c = signPadCanvasRef.current;
+                          const r = c.getBoundingClientRect();
+                          const ctx = c.getContext("2d")!;
+                          ctx.lineTo(e.clientX - r.left, e.clientY - r.top);
+                          ctx.stroke();
+                        }}
+                        onPointerUp={() => {
+                          isDrawingSignRef.current = false;
+                        }}
+                        className="w-full h-36 rounded-xl border border-slate-300 bg-slate-50 cursor-crosshair"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const c = signPadCanvasRef.current;
+                          if (c) {
+                            c.getContext("2d")?.clearRect(0, 0, c.width, c.height);
+                          }
+                        }}
+                        className="text-xs text-slate-500 hover:text-slate-800 underline"
+                      >
+                        Clear pad
+                      </button>
+                    </div>
+                  ) : (
+                    <input
+                      type="text"
+                      value={typedSignature}
+                      onChange={(e) => setTypedSignature(e.target.value)}
+                      placeholder="Type your full name..."
+                      style={{
+                        fontFamily: '"Dancing Script", cursive',
+                        color: signColor,
+                      }}
+                      className="w-full rounded-xl border border-slate-300 px-4 py-4 text-3xl outline-none focus:border-sky-500"
+                    />
+                  )}
+
+                  <div className="flex items-center justify-between pt-2">
+                    <div className="flex items-center gap-1.5">
+                      {(["#0f172a", "#1d4ed8", "#dc2626"] as const).map((c) => (
+                        <button
+                          key={c}
+                          type="button"
+                          onClick={() => setSignColor(c)}
+                          style={{ backgroundColor: c }}
+                          className={`h-6 w-6 rounded-full border-2 ${
+                            signColor === c ? "border-sky-500 scale-110" : "border-white"
+                          }`}
+                        />
+                      ))}
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setShowSignModal(false)}
+                        className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-600"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handlePlaceSignature}
+                        className="rounded-lg bg-sky-600 px-4 py-1.5 text-xs font-bold text-white hover:bg-sky-500"
+                      >
+                        Place Signature
+                      </button>
+                    </div>
+                  </div>
+                </div>
               </div>
             )}
 
-            {successMessage && (
-              <div className="flex items-start gap-2.5 rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-xs text-emerald-700">
-                <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600 mt-0.5" />
-                <span>{successMessage}</span>
+            {errorMessage && (
+              <div className="mt-3 rounded-xl border border-red-200 bg-red-50 px-4 py-2 text-xs text-red-700">
+                {errorMessage}
               </div>
             )}
           </div>
