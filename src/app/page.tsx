@@ -848,17 +848,11 @@ export default function HomePage() {
                       <Icon className="h-5 w-5" />
                     </div>
 
-                    {droppedFiles.length > 0 ? (
-                      <span className="inline-flex items-center gap-1 rounded-full bg-emerald-600 px-2.5 py-0.5 text-[10px] font-extrabold uppercase tracking-wider text-white shadow-xs">
-                        <span>Open File →</span>
+                    {tool.popular && (
+                      <span className="inline-flex items-center gap-1 rounded-full bg-gradient-to-r from-amber-500 via-orange-500 to-rose-500 px-2.5 py-0.5 text-[10px] font-extrabold uppercase tracking-wider text-white shadow-xs shadow-orange-500/20">
+                        <Sparkles className="h-2.5 w-2.5" />
+                        <span>Popular</span>
                       </span>
-                    ) : (
-                      tool.popular && (
-                        <span className="inline-flex items-center gap-1 rounded-full bg-gradient-to-r from-amber-500 via-orange-500 to-rose-500 px-2.5 py-0.5 text-[10px] font-extrabold uppercase tracking-wider text-white shadow-xs shadow-orange-500/20">
-                          <Sparkles className="h-2.5 w-2.5" />
-                          <span>Popular</span>
-                        </span>
-                      )
                     )}
                   </div>
 
