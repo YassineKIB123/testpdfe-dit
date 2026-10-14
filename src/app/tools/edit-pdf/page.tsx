@@ -21,7 +21,6 @@ import {
   Plus,
   Bold,
   Italic,
-  Sparkles,
   Undo2,
   Redo2,
   Search,
@@ -35,7 +34,6 @@ import {
   AlignCenter,
   AlignRight,
   ScanText,
-  Check,
   MousePointerClick,
 } from "lucide-react";
 
@@ -53,6 +51,7 @@ export interface TextBlockItem {
   isWhiteoutOnly?: boolean;
   isMultiline?: boolean;
   lineHeightPt?: number;
+  rawFontSizePt: number;
   origXPercent: number;
   origYPercent: number;
   origBaselineYPercent: number;
@@ -62,6 +61,13 @@ export interface TextBlockItem {
   yPercent: number;
   widthPercent: number;
   heightPercent: number;
+  // Saved original typography (locked when extracted so editing text never mutates size/style)
+  origFontSizePt: number;
+  origFontFamily: PdfFontFamily;
+  origColor: string;
+  origIsBold: boolean;
+  origIsItalic: boolean;
+  // Current active typography
   fontSizePt: number;
   fontFamily: PdfFontFamily;
   color: string;
@@ -167,6 +173,10 @@ function detectDocumentDefaultFontFromBytes(buffer: ArrayBuffer): PdfFontFamily 
   }
 }
 
+/**
+ * Determines fontFamily, isBold, and isItalic strictly from the PDF's actual font descriptor
+ * and font name table (never guessing Bold from pixel darkness so regular text never turns Bold!).
+ */
 function classifyPdfFontMetadata(
   realFontName: string,
   fallbackStyleFamily: string,
@@ -219,7 +229,11 @@ function classifyPdfFontMetadata(
   return { fontFamily, isBold, isItalic };
 }
 
-function calibrateFontSizePt(
+/**
+ * Gently calibrates fontSizePt on full lines (>= 10 chars) against the exact PDF line width
+ * with a tight [0.91x .. 1.02x] clamp so the original PDF font size is faithfully preserved.
+ */
+function calibrateLineFontSizePt(
   text: string,
   targetWidthPt: number,
   rawFontSizePt: number,
@@ -227,37 +241,42 @@ function calibrateFontSizePt(
   isBold: boolean,
   isItalic: boolean
 ): number {
-  const fallback = Math.round(rawFontSizePt * 10) / 10;
+  const exactRaw = Math.round(rawFontSizePt * 10) / 10;
   const firstLine = (text || "").split("\n")[0];
   if (
     !firstLine ||
-    firstLine.trim().length < 3 ||
-    targetWidthPt <= 8 ||
+    firstLine.trim().length < 10 ||
+    targetWidthPt <= 25 ||
     typeof document === "undefined"
   ) {
-    return fallback;
+    return exactRaw;
   }
   try {
     const c = document.createElement("canvas");
     const ctx = c.getContext("2d");
-    if (!ctx) return fallback;
+    if (!ctx) return exactRaw;
     const testPx = 100;
     const prefix = `${isItalic ? "italic " : ""}${isBold ? "bold " : ""}`;
     ctx.font = `${prefix}${testPx}px ${FONT_CSS_MAP[fontFamily]}`;
     const measuredAt100 = ctx.measureText(firstLine).width;
-    if (measuredAt100 <= 0) return fallback;
+    if (measuredAt100 <= 0) return exactRaw;
 
     const widthMatchedPt = (targetWidthPt / measuredAt100) * testPx;
     const clamped = Math.max(
-      rawFontSizePt * 0.76,
-      Math.min(rawFontSizePt * 1.04, widthMatchedPt)
+      rawFontSizePt * 0.91,
+      Math.min(rawFontSizePt * 1.02, widthMatchedPt)
     );
     return Math.round(clamped * 10) / 10;
   } catch {
-    return fallback;
+    return exactRaw;
   }
 }
 
+/**
+ * Samples the rendered PDF canvas for background color (`autoBgHex`), optical ink color (`autoFgHex`),
+ * and horizontal baseline Serif-foot ratio (`pixelIsSerif`).
+ * Never overrides `isBold` from pixels so regular text never turns Bold!
+ */
 function sampleCanvasStyleForBox(
   ctx: CanvasRenderingContext2D,
   canvasW: number,
@@ -266,7 +285,7 @@ function sampleCanvasStyleForBox(
   boxYPx: number,
   boxWPx: number,
   boxHPx: number
-): { autoBgHex: string; autoFgHex: string; pixelIsSerif: boolean; pixelIsBold: boolean } {
+): { autoBgHex: string; autoFgHex: string; pixelIsSerif: boolean } {
   try {
     const pad = 2;
     const sx = Math.max(0, Math.floor(boxXPx - pad));
@@ -277,9 +296,8 @@ function sampleCanvasStyleForBox(
     if (sw <= 3 || sh <= 3) {
       return {
         autoBgHex: "#ffffff",
-        autoFgHex: "#36383e",
+        autoFgHex: "#22252a",
         pixelIsSerif: false,
-        pixelIsBold: false,
       };
     }
 
@@ -312,7 +330,6 @@ function sampleCanvasStyleForBox(
 
     const inkPixels: { r: number; g: number; b: number; dist: number }[] = [];
     const rowInkCounts: number[] = new Array(sh).fill(0);
-    let veryDarkCount = 0;
 
     for (let y = 1; y < sh - 1; y++) {
       for (let x = 1; x < sw - 1; x++) {
@@ -321,12 +338,9 @@ function sampleCanvasStyleForBox(
         const g = imgData[idx + 1];
         const b = imgData[idx + 2];
         const dist = Math.abs(r - bgR) + Math.abs(g - bgG) + Math.abs(b - bgB);
-        if (dist > 70) {
+        if (dist > 75) {
           inkPixels.push({ r, g, b, dist });
           rowInkCounts[y]++;
-          if (dist > 480) {
-            veryDarkCount++;
-          }
         }
       }
     }
@@ -334,22 +348,20 @@ function sampleCanvasStyleForBox(
     if (inkPixels.length === 0) {
       return {
         autoBgHex: rgbToHex(bgR, bgG, bgB),
-        autoFgHex: "#36383e",
+        autoFgHex: "#22252a",
         pixelIsSerif: false,
-        pixelIsBold: false,
       };
     }
 
     inkPixels.sort((a, b) => b.dist - a.dist);
 
-    const coreRatio = veryDarkCount / Math.max(1, inkPixels.length);
     const topPixel = inkPixels[0];
     const colorSat =
       Math.max(topPixel.r, topPixel.g, topPixel.b) -
       Math.min(topPixel.r, topPixel.g, topPixel.b);
 
-    const startRatio = colorSat > 35 ? 0.08 : 0.22;
-    const endRatio = colorSat > 35 ? 0.35 : 0.54;
+    const startRatio = colorSat > 35 ? 0.05 : 0.15;
+    const endRatio = colorSat > 35 ? 0.30 : 0.42;
     const startIdx = Math.floor(inkPixels.length * startRatio);
     const endIdx = Math.max(startIdx + 1, Math.floor(inkPixels.length * endRatio));
 
@@ -366,12 +378,11 @@ function sampleCanvasStyleForBox(
     let fgG = sumG / count;
     let fgB = sumB / count;
 
+    // Keep standard dark-on-light text in a natural PDF ink range (#1c1e22 .. #32353b)
     const bgLum = (bgR + bgG + bgB) / 3;
     const fgLum = (fgR + fgG + fgB) / 3;
     if (bgLum > 200 && colorSat <= 30) {
-      const targetMinLum = coreRatio >= 0.62 ? 16 : 52;
-      const targetMaxLum = coreRatio >= 0.62 ? 36 : 68;
-      const clampedLum = Math.max(targetMinLum, Math.min(targetMaxLum, fgLum));
+      const clampedLum = Math.max(24, Math.min(48, fgLum));
       const delta = clampedLum - fgLum;
       fgR += delta;
       fgG += delta;
@@ -392,20 +403,16 @@ function sampleCanvasStyleForBox(
       }
     }
 
-    const pixelIsBold = coreRatio >= 0.64 && fgLum < 32;
-
     return {
       autoBgHex: rgbToHex(bgR, bgG, bgB),
       autoFgHex: rgbToHex(fgR, fgG, fgB),
       pixelIsSerif,
-      pixelIsBold,
     };
   } catch {
     return {
       autoBgHex: "#ffffff",
-      autoFgHex: "#36383e",
+      autoFgHex: "#22252a",
       pixelIsSerif: false,
-      pixelIsBold: false,
     };
   }
 }
@@ -433,6 +440,11 @@ export function isBlockModified(b: TextBlockItem): boolean {
   return (
     b.isNew ||
     b.currentText !== b.originalText ||
+    b.fontSizePt !== b.origFontSizePt ||
+    b.fontFamily !== b.origFontFamily ||
+    b.color !== b.origColor ||
+    b.isBold !== b.origIsBold ||
+    b.isItalic !== b.origIsItalic ||
     Math.abs(b.xPercent - b.origXPercent) > 0.1 ||
     Math.abs(b.yPercent - b.origYPercent) > 0.1 ||
     Math.abs(b.widthPercent - b.origWidthPercent) > 0.1 ||
@@ -440,9 +452,6 @@ export function isBlockModified(b: TextBlockItem): boolean {
   );
 }
 
-/**
- * Word-wraps a string (respecting explicit `\n` breaks and `maxWidthPx`) into lines for multi-line rendering.
- */
 function wrapTextIntoLines(
   ctx: CanvasRenderingContext2D,
   text: string,
@@ -477,8 +486,6 @@ export default function EditPdfPage() {
   const [currentPage, setCurrentPage] = useState<number>(1);
   const [pdfDocProxy, setPdfDocProxy] = useState<any>(null);
 
-  // Selection Granularity: "word" (individual words), "line" (lines), or "paragraph" (multi-line blocks)
-  // Plus users can ALWAYS drag a selection rectangle over ANY exact amount of text!
   const [selectionGranularity, setSelectionGranularity] =
     useState<SelectionGranularity>("line");
 
@@ -488,7 +495,6 @@ export default function EditPdfPage() {
   >({});
   const [selectedBlockId, setSelectedBlockId] = useState<string | null>(null);
 
-  // Drag-Select Marquee state for selecting any custom amount of text (1 word, 3 words, or multi-line region)
   const [marqueeRect, setMarqueeRect] = useState<{
     startX: number;
     startY: number;
@@ -496,13 +502,10 @@ export default function EditPdfPage() {
     curY: number;
   } | null>(null);
 
-  const [showFindReplace, setShowFindReplace] = useState(true);
+  const [showFindReplace, setShowFindReplace] = useState(false);
   const [findQuery, setFindQuery] = useState("");
   const [replaceQuery, setReplaceQuery] = useState("");
   const [caseSensitiveFind, setCaseSensitiveFind] = useState(false);
-
-  const [selectedFindSubstr, setSelectedFindSubstr] = useState("");
-  const [selectedReplaceSubstr, setSelectedReplaceSubstr] = useState("");
 
   const [historyPast, setHistoryPast] = useState<TextBlockItem[][]>([]);
   const [historyFuture, setHistoryFuture] = useState<TextBlockItem[][]>([]);
@@ -581,8 +584,8 @@ export default function EditPdfPage() {
   }, [textBlocks]);
 
   /**
-   * Builds blocks at the requested granularity ("word", "line", or "paragraph") from word-level tokens,
-   * preserving any blocks the user has already modified!
+   * Builds blocks at the requested granularity ("word", "line", or "paragraph") from word tokens,
+   * using the true untouched PDF `rawFontSizePt` so font size and weight never mutate!
    */
   const buildBlocksForGranularity = useCallback(
     (
@@ -604,11 +607,11 @@ export default function EditPdfPage() {
         const sameBaseline =
           last &&
           Math.abs(last.origBaselineYPercent - w.origBaselineYPercent) <
-            ((Math.min(last.fontSizePt, w.fontSizePt) * 0.45) / pageH) * 100;
+            ((Math.min(last.rawFontSizePt, w.rawFontSizePt) * 0.45) / pageH) * 100;
         const gapPct = last
           ? w.origXPercent - (last.origXPercent + last.origWidthPercent)
           : Infinity;
-        const fontPctW = (Math.max(last?.fontSizePt || 10, w.fontSizePt) / pageW) * 100;
+        const fontPctW = (Math.max(last?.rawFontSizePt || 10, w.rawFontSizePt) / pageW) * 100;
         const isLastListMarker = Boolean(last && listMarkerRegex.test(last.originalText));
 
         if (
@@ -617,7 +620,8 @@ export default function EditPdfPage() {
           !(isLastListMarker && gapPct > fontPctW * 0.2) &&
           gapPct >= -fontPctW * 0.4 &&
           gapPct < fontPctW * 1.8 &&
-          Math.abs(last.fontSizePt - w.fontSizePt) <= 2.2
+          Math.abs(last.rawFontSizePt - w.rawFontSizePt) <= 2.0 &&
+          last.origIsBold === w.origIsBold
         ) {
           const newRight = Math.max(
             last.origXPercent + last.origWidthPercent,
@@ -625,13 +629,13 @@ export default function EditPdfPage() {
           );
           const newW = newRight - last.origXPercent;
           const combinedText = `${last.originalText} ${w.originalText}`;
-          const calibratedPt = calibrateFontSizePt(
+          const calibratedPt = calibrateLineFontSizePt(
             combinedText,
             (newW / 100) * pageW,
-            last.fontSizePt,
-            last.fontFamily,
-            last.isBold,
-            last.isItalic
+            last.rawFontSizePt,
+            last.origFontFamily,
+            last.origIsBold,
+            last.origIsItalic
           );
 
           last.originalText = combinedText;
@@ -640,6 +644,7 @@ export default function EditPdfPage() {
           last.widthPercent = newW;
           last.origHeightPercent = Math.max(last.origHeightPercent, w.origHeightPercent);
           last.heightPercent = last.origHeightPercent;
+          last.origFontSizePt = calibratedPt;
           last.fontSizePt = calibratedPt;
         } else {
           lines.push({ ...w, id: `line_${w.id}` });
@@ -653,7 +658,7 @@ export default function EditPdfPage() {
       const paragraphs: TextBlockItem[] = [];
       for (const ln of lines) {
         const lastP = paragraphs[paragraphs.length - 1];
-        const lineHeightPct = (ln.fontSizePt / pageH) * 100;
+        const lineHeightPct = (ln.rawFontSizePt / pageH) * 100;
         const verticalStepPct = lastP
           ? ln.origBaselineYPercent -
             (lastP.origYPercent + lastP.origHeightPercent - lineHeightPct * 0.25)
@@ -661,9 +666,9 @@ export default function EditPdfPage() {
         const sameIndent = lastP && Math.abs(lastP.origXPercent - ln.origXPercent) < 3.5;
         const sameFont =
           lastP &&
-          lastP.fontFamily === ln.fontFamily &&
-          Math.abs(lastP.fontSizePt - ln.fontSizePt) <= 1.5 &&
-          lastP.isBold === ln.isBold;
+          lastP.origFontFamily === ln.origFontFamily &&
+          Math.abs(lastP.rawFontSizePt - ln.rawFontSizePt) <= 1.5 &&
+          lastP.origIsBold === ln.origIsBold;
 
         if (
           lastP &&
@@ -684,7 +689,7 @@ export default function EditPdfPage() {
           lastP.originalText = `${lastP.originalText}\n${ln.originalText}`;
           lastP.currentText = lastP.originalText;
           lastP.isMultiline = true;
-          lastP.lineHeightPt = Math.round(ln.fontSizePt * 1.32 * 10) / 10;
+          lastP.lineHeightPt = Math.round(ln.rawFontSizePt * 1.32 * 10) / 10;
           lastP.origWidthPercent = newRight - lastP.origXPercent;
           lastP.widthPercent = lastP.origWidthPercent;
           lastP.origHeightPercent = newBottom - lastP.origYPercent;
@@ -693,7 +698,7 @@ export default function EditPdfPage() {
           paragraphs.push({
             ...ln,
             id: `para_${ln.id}`,
-            lineHeightPt: Math.round(ln.fontSizePt * 1.32 * 10) / 10,
+            lineHeightPt: Math.round(ln.rawFontSizePt * 1.32 * 10) / 10,
           });
         }
       }
@@ -703,10 +708,6 @@ export default function EditPdfPage() {
     []
   );
 
-  /**
-   * Extracts word-level tokens from a PDF page so the user can hover/click single words,
-   * full lines, paragraphs, OR drag-select any exact custom amount of text!
-   */
   const extractWordTokensFromPage = useCallback(
     async (
       pdf: any,
@@ -733,7 +734,7 @@ export default function EditPdfPage() {
         baselineY: number;
         w: number;
         h: number;
-        fontSize: number;
+        rawFontSize: number;
         fontFamily: PdfFontFamily;
         isBold: boolean;
         isItalic: boolean;
@@ -747,14 +748,14 @@ export default function EditPdfPage() {
         const m = multiplyTransform(vpTransform, item.transform);
         const vx = m[4];
         const vBaselineY = m[5];
-        const fontSize = Math.max(
+        const rawFontSize = Math.max(
           6.5,
           Math.round((Math.hypot(m[2], m[3]) || Math.hypot(m[0], m[1])) * 10) / 10
         );
 
-        const itemW = item.width || item.str.length * (fontSize * 0.5);
-        const itemH = Math.max(fontSize * 1.08, item.height || fontSize * 1.08);
-        const yTop = vBaselineY - fontSize * 0.8;
+        const itemW = item.width || item.str.length * (rawFontSize * 0.5);
+        const itemH = Math.max(rawFontSize * 1.08, item.height || rawFontSize * 1.08);
+        const yTop = vBaselineY - rawFontSize * 0.8;
 
         const styleObj = stylesDict[item.fontName] || {};
         let fObj: any = null;
@@ -777,7 +778,7 @@ export default function EditPdfPage() {
           realFontName,
           styleObj.fontFamily || "",
           item.transform[2],
-          fontSize,
+          rawFontSize,
           docDefaultFontRef.current,
           fObj
         );
@@ -792,9 +793,9 @@ export default function EditPdfPage() {
             x: vx,
             yTop,
             baselineY: vBaselineY,
-            w: Math.max(itemW, fontSize * 0.45),
+            w: Math.max(itemW, rawFontSize * 0.45),
             h: itemH,
-            fontSize,
+            rawFontSize,
             fontFamily,
             isBold,
             isItalic,
@@ -805,7 +806,7 @@ export default function EditPdfPage() {
             const startChar = match.index || 0;
             const wordX = vx + (startChar / totalChars) * itemW;
             const wordW = Math.max(
-              fontSize * 0.4,
+              rawFontSize * 0.4,
               (wordStr.length / totalChars) * itemW
             );
             wordFrags.push({
@@ -815,7 +816,7 @@ export default function EditPdfPage() {
               baselineY: vBaselineY,
               w: wordW,
               h: itemH,
-              fontSize,
+              rawFontSize,
               fontFamily,
               isBold,
               isItalic,
@@ -825,7 +826,7 @@ export default function EditPdfPage() {
       }
 
       wordFrags.sort((a, b) => {
-        if (Math.abs(a.yTop - b.yTop) > Math.min(a.fontSize, b.fontSize) * 0.42) {
+        if (Math.abs(a.yTop - b.yTop) > Math.min(a.rawFontSize, b.rawFontSize) * 0.42) {
           return a.yTop - b.yTop;
         }
         return a.x - b.x;
@@ -837,9 +838,15 @@ export default function EditPdfPage() {
         const sameBase =
           prev &&
           Math.abs(prev.baselineY - wf.baselineY) <
-            Math.min(prev.fontSize, wf.fontSize) * 0.4;
+            Math.min(prev.rawFontSize, wf.rawFontSize) * 0.4;
         const gap = prev ? wf.x - (prev.x + prev.w) : Infinity;
-        if (sameBase && prev && gap >= -wf.fontSize * 0.35 && gap <= wf.fontSize * 0.13) {
+        if (
+          sameBase &&
+          prev &&
+          gap >= -wf.rawFontSize * 0.35 &&
+          gap <= wf.rawFontSize * 0.13 &&
+          prev.isBold === wf.isBold
+        ) {
           prev.text += wf.text;
           prev.w = Math.max(prev.w, wf.x + wf.w - prev.x);
           prev.h = Math.max(prev.h, wf.h);
@@ -850,9 +857,8 @@ export default function EditPdfPage() {
 
       return cleanWords.map((wd, idx) => {
         let autoBgHex = "#ffffff";
-        let autoFgHex = "#36383e";
+        let autoFgHex = "#22252a";
         let finalFontFamily: PdfFontFamily = wd.fontFamily;
-        let finalIsBold = wd.isBold;
 
         if (canvasCtx && canvasW && canvasH) {
           const sampled = sampleCanvasStyleForBox(
@@ -869,19 +875,7 @@ export default function EditPdfPage() {
           if (sampled.pixelIsSerif && finalFontFamily !== "mono") {
             finalFontFamily = "serif";
           }
-          if (sampled.pixelIsBold) {
-            finalIsBold = true;
-          }
         }
-
-        const calibratedPt = calibrateFontSizePt(
-          wd.text,
-          wd.w,
-          wd.fontSize,
-          finalFontFamily,
-          finalIsBold,
-          wd.isItalic
-        );
 
         const xPct = Math.max(0, Math.min(98, (wd.x / pageW) * 100));
         const yPct = Math.max(0, Math.min(98, (wd.yTop / pageH) * 100));
@@ -895,6 +889,7 @@ export default function EditPdfPage() {
           originalText: wd.text,
           currentText: wd.text,
           isNew: false,
+          rawFontSizePt: wd.rawFontSize,
           origXPercent: xPct,
           origYPercent: yPct,
           origBaselineYPercent: baseYPct,
@@ -904,10 +899,15 @@ export default function EditPdfPage() {
           yPercent: yPct,
           widthPercent: wPct,
           heightPercent: hPct,
-          fontSizePt: calibratedPt,
+          origFontSizePt: wd.rawFontSize,
+          origFontFamily: finalFontFamily,
+          origColor: autoFgHex,
+          origIsBold: wd.isBold,
+          origIsItalic: wd.isItalic,
+          fontSizePt: wd.rawFontSize,
           fontFamily: finalFontFamily,
           color: autoFgHex,
-          isBold: finalIsBold,
+          isBold: wd.isBold,
           isItalic: wd.isItalic,
           textAlign: "left",
           maskBg: "auto",
@@ -1198,13 +1198,9 @@ export default function EditPdfPage() {
   const handleSelectBlock = useCallback((block: TextBlockItem | null) => {
     if (!block) {
       setSelectedBlockId(null);
-      setSelectedFindSubstr("");
-      setSelectedReplaceSubstr("");
       return;
     }
     setSelectedBlockId(block.id);
-    setSelectedFindSubstr(block.currentText);
-    setSelectedReplaceSubstr(block.currentText);
     if (!block.isWhiteoutOnly && block.currentText) {
       setFindQuery(block.currentText);
       setReplaceQuery(block.currentText);
@@ -1212,9 +1208,24 @@ export default function EditPdfPage() {
   }, []);
 
   /**
-   * Starts a Drag-to-Select Marquee when the user clicks and drags on the PDF page,
-   * allowing them to highlight and edit ANY exact amount of text (1 word, 3 words, or a paragraph)!
+   * Moves the active cursor to the previous or next line on the page (like Up/Down arrows in Microsoft Word).
    */
+  const handleNavigateLine = useCallback(
+    (direction: "up" | "down") => {
+      if (!selectedBlockId) return;
+      const pageBlocks = textBlocks
+        .filter((b) => b.pageNumber === currentPage && !b.isWhiteoutOnly)
+        .sort((a, b) => a.yPercent - b.yPercent || a.xPercent - b.xPercent);
+      const idx = pageBlocks.findIndex((b) => b.id === selectedBlockId);
+      if (idx === -1) return;
+      const targetIdx = direction === "down" ? idx + 1 : idx - 1;
+      if (targetIdx >= 0 && targetIdx < pageBlocks.length) {
+        handleSelectBlock(pageBlocks[targetIdx]);
+      }
+    },
+    [selectedBlockId, textBlocks, currentPage, handleSelectBlock]
+  );
+
   const handleViewportPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (previewCleanMode || !pdfCanvasRef.current) return;
     if (e.button !== 0) return;
@@ -1298,6 +1309,15 @@ export default function EditPdfPage() {
         const boxW = Math.max(2, boxRight - boxLeft);
         const boxH = Math.max(1.4, boxBottom - boxTop);
 
+        const calibratedPt = calibrateLineFontSizePt(
+          lineTexts[0],
+          (boxW / 100) * pageBaseSizePt.width,
+          firstWord.rawFontSizePt,
+          firstWord.origFontFamily,
+          firstWord.origIsBold,
+          firstWord.origIsItalic
+        );
+
         const customId = `custom_sel_${Date.now()}`;
         const customBlock: TextBlockItem = {
           ...firstWord,
@@ -1305,7 +1325,9 @@ export default function EditPdfPage() {
           originalText: combinedText,
           currentText: combinedText,
           isMultiline: lineTexts.length > 1,
-          lineHeightPt: Math.round(firstWord.fontSizePt * 1.32 * 10) / 10,
+          lineHeightPt: Math.round(firstWord.rawFontSizePt * 1.32 * 10) / 10,
+          origFontSizePt: calibratedPt,
+          fontSizePt: calibratedPt,
           origXPercent: boxLeft,
           origYPercent: boxTop,
           origBaselineYPercent: firstWord.origBaselineYPercent,
@@ -1329,7 +1351,7 @@ export default function EditPdfPage() {
       window.removeEventListener("pointermove", handleMove);
       window.removeEventListener("pointerup", handleUp);
     };
-  }, [interactionMode, currentPage, wordTokensByPage, handleSelectBlock]);
+  }, [interactionMode, currentPage, wordTokensByPage, pageBaseSizePt.width, handleSelectBlock]);
 
   const handleUpdateBlock = useCallback(
     (id: string, patch: Partial<TextBlockItem>, recordHistory: boolean = true) => {
@@ -1352,6 +1374,7 @@ export default function EditPdfPage() {
       originalText: "",
       currentText: "New Text",
       isNew: true,
+      rawFontSizePt: 11,
       origXPercent: 25,
       origYPercent: 25,
       origBaselineYPercent: 26.8,
@@ -1361,9 +1384,14 @@ export default function EditPdfPage() {
       yPercent: 25,
       widthPercent: 28,
       heightPercent: 3.5,
+      origFontSizePt: 11,
+      origFontFamily: docDefaultFontRef.current,
+      origColor: "#22252a",
+      origIsBold: false,
+      origIsItalic: false,
       fontSizePt: 11,
       fontFamily: docDefaultFontRef.current,
-      color: "#36383e",
+      color: "#22252a",
       isBold: false,
       isItalic: false,
       textAlign: "left",
@@ -1386,6 +1414,7 @@ export default function EditPdfPage() {
       currentText: "",
       isNew: true,
       isWhiteoutOnly: true,
+      rawFontSizePt: 11,
       origXPercent: 30,
       origYPercent: 35,
       origBaselineYPercent: 37,
@@ -1395,9 +1424,14 @@ export default function EditPdfPage() {
       yPercent: 35,
       widthPercent: 28,
       heightPercent: 4.5,
+      origFontSizePt: 11,
+      origFontFamily: docDefaultFontRef.current,
+      origColor: "#22252a",
+      origIsBold: false,
+      origIsItalic: false,
       fontSizePt: 11,
       fontFamily: docDefaultFontRef.current,
-      color: "#36383e",
+      color: "#22252a",
       isBold: false,
       isItalic: false,
       textAlign: "left",
@@ -1430,11 +1464,14 @@ export default function EditPdfPage() {
     setTextBlocks((prev) =>
       prev.map((b) => {
         if (b.id !== id) return b;
-        setSelectedFindSubstr(b.originalText);
-        setSelectedReplaceSubstr(b.originalText);
         return {
           ...b,
           currentText: b.originalText,
+          fontSizePt: b.origFontSizePt,
+          fontFamily: b.origFontFamily,
+          color: b.origColor,
+          isBold: b.origIsBold,
+          isItalic: b.origIsItalic,
           xPercent: b.origXPercent,
           yPercent: b.origYPercent,
           widthPercent: b.origWidthPercent,
@@ -1671,21 +1708,7 @@ export default function EditPdfPage() {
 
     try {
       let workingBlocks = [...textBlocks];
-      if (
-        selectedBlockId &&
-        selectedReplaceSubstr !== selectedFindSubstr &&
-        selectedFindSubstr.trim()
-      ) {
-        workingBlocks = workingBlocks.map((b) =>
-          b.id === selectedBlockId
-            ? {
-                ...b,
-                currentText: b.currentText.split(selectedFindSubstr).join(selectedReplaceSubstr),
-              }
-            : b
-        );
-        setTextBlocks(workingBlocks);
-      } else if (findQuery.trim() && workingBlocks.filter(isBlockModified).length === 0) {
+      if (findQuery.trim() && workingBlocks.filter(isBlockModified).length === 0) {
         const escaped = findQuery.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
         const regex = new RegExp(escaped, caseSensitiveFind ? "g" : "gi");
         workingBlocks = workingBlocks.map((b) =>
@@ -1842,7 +1865,6 @@ export default function EditPdfPage() {
   };
 
   const currentPageBlocks = textBlocks.filter((b) => b.pageNumber === currentPage);
-  const detectedExistingLinesOnPage = currentPageBlocks.filter((b) => !b.isNew).length;
   const selectedBlock = textBlocks.find((b) => b.id === selectedBlockId) || null;
   const displayScale =
     pageBaseSizePt.width > 0 ? containerCssWidth / pageBaseSizePt.width : 1.15;
@@ -1850,22 +1872,22 @@ export default function EditPdfPage() {
   return (
     <ToolLayout
       title="Edit PDF Text Online"
-      description="Drag-select any exact words, lines, or paragraphs in your PDF to edit or replace them in-place with automatic font, size, and optical ink-color matching—100% private in your browser."
+      description="Click any word, line, or paragraph in your PDF to edit it directly in-place just like a Microsoft Word document—preserving exact original font family, size, weight, and ink color."
       faqs={[
         {
-          question: "How do I edit just one word, a few words, or a whole paragraph?",
+          question: "How does it preserve the exact original font style and size?",
           answer:
-            "You can either drag a selection box over the exact words or paragraph you want to edit on the page, or use the Selection Mode switcher ('Word', 'Line', or 'Paragraph') in the top toolbar to choose how much text is highlighted when you hover.",
+            "When your PDF loads, our engine reads the embedded PDF font table and locks each line's exact point size, weight (Regular vs Bold), and style (Serif, Calibri, Sans, or Monospace). When you click to edit, your typed text inherits those exact locked settings.",
         },
         {
-          question: "How does automatic font and ink darkness matching work?",
+          question: "Can I edit just a single word, a line, or a full paragraph?",
           answer:
-            "Our engine inspects both the embedded PDF font table (supporting LaTeX Computer Modern, Times/Serif, Calibri, Arial, and Courier) and the rendered glyph pixels on the page to match exact font family, decimal point size, baseline, and optical stroke shade.",
+            "Yes! Use the 'Word | Line | Paragraph' selector in the top ribbon—or simply drag your mouse across any exact words on the page—to edit as much or as little text as you want.",
         },
         {
-          question: "Does this PDF text editor support French accents, Arabic, and Cyrillic?",
+          question: "Can I use Up and Down arrow keys like in Microsoft Word?",
           answer:
-            "Yes. Replacement text is rendered using a High-DPI Unicode graphics layer, so English, French (é, è, ê, à), Spanish, Russian, and Arabic scripts embed cleanly without font errors.",
+            "Yes. While editing a line on the page, press the Up or Down arrow keys (or Enter) to move seamlessly between lines.",
         },
       ]}
     >
@@ -1876,45 +1898,42 @@ export default function EditPdfPage() {
             multiple={false}
             onFilesSelected={handleFileSelected}
             title="Drop a PDF document to edit existing text"
-            description="Drag over any exact words or paragraphs—or hover by Word, Line, or Paragraph—to edit in-place with matched fonts and ink colors."
+            description="Click anywhere on your PDF page to edit text directly in-place like a Word document with locked original font size and style."
           />
         )}
 
         {file && (
-          <div className="space-y-4 rounded-2xl border border-slate-200 bg-slate-50/60 p-4 sm:p-6 dark:border-slate-800 dark:bg-slate-900/60">
-            {/* Top Primary Toolbar */}
-            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 dark:border-slate-800 pb-3.5">
-              <div className="flex items-center gap-3">
-                <div className="flex h-10 w-10 items-center justify-center rounded-lg border border-rose-100 bg-rose-50 text-rose-600 dark:border-rose-900/40 dark:bg-rose-950/40 dark:text-rose-400">
-                  <FileEdit className="h-5 w-5" />
+          <div className="space-y-3 rounded-2xl border border-slate-200 bg-slate-50/70 p-3 sm:p-5 dark:border-slate-800 dark:bg-slate-900/60">
+            {/* Row 1: Document Bar + Granularity + Actions */}
+            <div className="flex flex-wrap items-center justify-between gap-2.5 border-b border-slate-200 dark:border-slate-800 pb-3">
+              <div className="flex items-center gap-2.5">
+                <div className="flex h-9 w-9 items-center justify-center rounded-lg border border-blue-100 bg-blue-50 text-blue-600 dark:border-blue-900/40 dark:bg-blue-950/40 dark:text-blue-400">
+                  <FileEdit className="h-4 w-4" />
                 </div>
                 <div>
-                  <h2 className="text-sm font-bold text-slate-900 dark:text-white truncate max-w-[200px] sm:max-w-xs">
+                  <h2 className="text-xs sm:text-sm font-bold text-slate-900 dark:text-white truncate max-w-[180px] sm:max-w-xs">
                     {file.name}
                   </h2>
-                  <p className="font-mono text-xs text-slate-500 dark:text-slate-400">
-                    Page {currentPage} of {totalPages} •{" "}
-                    <span className="text-rose-600 dark:text-rose-400 font-bold">
-                      {detectedExistingLinesOnPage} selectable {selectionGranularity}s
-                    </span>
+                  <p className="font-mono text-[11px] text-slate-500 dark:text-slate-400">
+                    Page {currentPage} of {totalPages}
                     {modifiedBlocks.length > 0 && (
                       <span className="ml-1.5 text-emerald-600 dark:text-emerald-400 font-bold">
-                        ({modifiedBlocks.length} edited)
+                        • {modifiedBlocks.length} edited
                       </span>
                     )}
                   </p>
                 </div>
               </div>
 
-              <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
-                {/* Smart Selection Granularity Switcher: Word | Line | Paragraph */}
+              <div className="flex flex-wrap items-center gap-1.5">
+                {/* Selection Mode: Word | Line | Paragraph */}
                 <div
                   className="inline-flex items-center rounded-xl border border-slate-200 bg-white p-0.5 text-xs dark:border-slate-800 dark:bg-slate-900"
-                  title="Choose how much text is selected on hover (or drag a box over any custom amount of text!)"
+                  title="Choose click granularity (or drag across any custom words)"
                 >
-                  <span className="hidden lg:inline-flex items-center gap-1 px-2 text-[11px] font-semibold text-slate-400">
-                    <MousePointerClick className="h-3.5 w-3.5 text-rose-600" />
-                    <span>Select:</span>
+                  <span className="hidden xl:inline-flex items-center gap-1 px-2 text-[11px] font-semibold text-slate-400">
+                    <MousePointerClick className="h-3.5 w-3.5 text-blue-600" />
+                    <span>Mode:</span>
                   </span>
                   {(
                     [
@@ -1930,9 +1949,9 @@ export default function EditPdfPage() {
                         setSelectionGranularity(mode.id);
                         handleSelectBlock(null);
                       }}
-                      className={`rounded-lg px-2.5 py-1.5 text-xs font-bold transition-colors ${
+                      className={`rounded-lg px-2.5 py-1 text-xs font-bold transition-colors ${
                         selectionGranularity === mode.id
-                          ? "bg-rose-600 text-white shadow-2xs"
+                          ? "bg-blue-600 text-white shadow-2xs"
                           : "text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800"
                       }`}
                     >
@@ -1941,55 +1960,56 @@ export default function EditPdfPage() {
                   ))}
                 </div>
 
+                {/* Undo / Redo */}
                 <div className="inline-flex items-center rounded-xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900 p-0.5">
                   <button
                     type="button"
                     onClick={handleUndo}
                     disabled={historyPast.length === 0}
                     title="Undo (Ctrl+Z)"
-                    className="rounded-lg p-1.5 text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800 disabled:opacity-30 transition-colors"
+                    className="rounded-lg p-1.5 text-slate-600 hover:bg-slate-100 dark:text-slate-300 disabled:opacity-30"
                   >
-                    <Undo2 className="h-4 w-4" />
+                    <Undo2 className="h-3.5 w-3.5" />
                   </button>
                   <button
                     type="button"
                     onClick={handleRedo}
                     disabled={historyFuture.length === 0}
                     title="Redo (Ctrl+Y)"
-                    className="rounded-lg p-1.5 text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800 disabled:opacity-30 transition-colors"
+                    className="rounded-lg p-1.5 text-slate-600 hover:bg-slate-100 dark:text-slate-300 disabled:opacity-30"
                   >
-                    <Redo2 className="h-4 w-4" />
+                    <Redo2 className="h-3.5 w-3.5" />
                   </button>
                 </div>
 
                 <button
                   type="button"
                   onClick={() => setShowFindReplace((v) => !v)}
-                  className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-2 text-xs font-semibold transition-colors ${
+                  className={`inline-flex items-center gap-1 rounded-xl border px-2.5 py-1.5 text-xs font-semibold transition-colors ${
                     showFindReplace
-                      ? "border-rose-600 bg-rose-50 text-rose-700 dark:bg-rose-950/50 dark:text-rose-300"
+                      ? "border-blue-600 bg-blue-50 text-blue-700 dark:bg-blue-950/50 dark:text-blue-300"
                       : "border-slate-200 bg-white text-slate-700 hover:bg-slate-50 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-200"
                   }`}
                 >
-                  <Search className="h-3.5 w-3.5 text-rose-600" />
+                  <Search className="h-3.5 w-3.5 text-blue-600" />
                   <span>Find & Replace</span>
                 </button>
 
                 <button
                   type="button"
                   onClick={handleAddFreeText}
-                  className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900 px-3 py-2 text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-50 transition-colors"
+                  className="inline-flex items-center gap-1 rounded-xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900 px-2.5 py-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-50"
                 >
-                  <Plus className="h-3.5 w-3.5 text-rose-600" />
-                  <span>+ Add Text</span>
+                  <Plus className="h-3.5 w-3.5 text-blue-600" />
+                  <span>+ Text</span>
                 </button>
 
                 <button
                   type="button"
                   onClick={handleAddWhiteoutBox}
-                  className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900 px-3 py-2 text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-50 transition-colors"
+                  className="inline-flex items-center gap-1 rounded-xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900 px-2.5 py-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-50"
                 >
-                  <Eraser className="h-3.5 w-3.5 text-rose-600" />
+                  <Eraser className="h-3.5 w-3.5 text-blue-600" />
                   <span>+ Whiteout</span>
                 </button>
 
@@ -1999,10 +2019,9 @@ export default function EditPdfPage() {
                     setPreviewCleanMode((v) => !v);
                     handleSelectBlock(null);
                   }}
-                  title="Toggle Clean Preview (hide edit boxes)"
-                  className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-2 text-xs font-semibold transition-colors ${
+                  className={`inline-flex items-center gap-1 rounded-xl border px-2.5 py-1.5 text-xs font-semibold transition-colors ${
                     previewCleanMode
-                      ? "border-emerald-600 bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300"
+                      ? "border-emerald-600 bg-emerald-50 text-emerald-700"
                       : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-300"
                   }`}
                 >
@@ -2011,16 +2030,14 @@ export default function EditPdfPage() {
                   ) : (
                     <Eye className="h-3.5 w-3.5" />
                   )}
-                  <span className="hidden sm:inline">
-                    {previewCleanMode ? "Exit Preview" : "Preview"}
-                  </span>
+                  <span className="hidden sm:inline">Preview</span>
                 </button>
 
                 <button
                   type="button"
                   onClick={handleSaveEditedPdf}
                   disabled={isSaving}
-                  className="inline-flex items-center gap-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 px-4 py-2 text-xs font-bold text-white shadow-sm disabled:opacity-50 transition-all"
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-blue-600 hover:bg-blue-500 px-3.5 py-1.5 text-xs font-bold text-white shadow-sm disabled:opacity-50 transition-all"
                 >
                   {isSaving ? (
                     <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -2040,39 +2057,274 @@ export default function EditPdfPage() {
                     setWordTokensByPage({});
                     handleSelectBlock(null);
                   }}
-                  className="inline-flex items-center gap-1 rounded-xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900 px-2.5 py-2 text-xs font-semibold text-slate-600 dark:text-slate-300 hover:bg-slate-50 transition-colors"
+                  className="inline-flex items-center rounded-xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900 p-1.5 text-slate-500 hover:bg-slate-50"
+                  title="Close PDF"
                 >
                   <Trash2 className="h-3.5 w-3.5" />
                 </button>
               </div>
             </div>
 
-            {/* Find & Replace Bar */}
+            {/* Row 2: Constant-Height Microsoft Word Style Formatting Ribbon (Never jumps the page!) */}
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs shadow-2xs dark:border-slate-800 dark:bg-slate-900">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="font-bold text-slate-600 dark:text-slate-300 flex items-center gap-1">
+                  <Type className="h-3.5 w-3.5 text-blue-600" />
+                  <span>Font:</span>
+                </span>
+
+                {/* Font Family */}
+                <select
+                  disabled={!selectedBlock || Boolean(selectedBlock.isWhiteoutOnly)}
+                  value={selectedBlock ? selectedBlock.fontFamily : docDefaultFontRef.current}
+                  onChange={(e) =>
+                    selectedBlock &&
+                    handleUpdateBlock(selectedBlock.id, {
+                      fontFamily: e.target.value as PdfFontFamily,
+                    })
+                  }
+                  aria-label="Font Family"
+                  className="rounded border border-slate-200 bg-slate-50 px-2 py-1 text-xs font-medium text-slate-900 disabled:opacity-60 dark:border-slate-700 dark:bg-slate-800 dark:text-white"
+                >
+                  <option value="serif">Times New Roman / Serif</option>
+                  <option value="calibri">Calibri (Word Body)</option>
+                  <option value="sans">Arial / Helvetica</option>
+                  <option value="mono">Courier New (Mono)</option>
+                </select>
+
+                {/* Font Size */}
+                <div className="flex items-center gap-1">
+                  <input
+                    type="number"
+                    step="0.5"
+                    min={6}
+                    max={72}
+                    disabled={!selectedBlock || Boolean(selectedBlock.isWhiteoutOnly)}
+                    value={selectedBlock ? selectedBlock.fontSizePt : 11}
+                    onChange={(e) =>
+                      selectedBlock &&
+                      handleUpdateBlock(selectedBlock.id, {
+                        fontSizePt: Math.max(6, Math.min(72, Number(e.target.value) || 11)),
+                      })
+                    }
+                    title="Font Size (pt)"
+                    className="w-14 rounded border border-slate-200 bg-slate-50 px-1.5 py-1 font-mono text-xs text-slate-900 disabled:opacity-60 dark:border-slate-700 dark:bg-slate-800 dark:text-white"
+                  />
+                  <span className="text-[11px] text-slate-400">pt</span>
+                </div>
+
+                {/* Bold & Italic */}
+                <div className="inline-flex items-center rounded border border-slate-200 bg-slate-50 dark:border-slate-700 dark:bg-slate-800 overflow-hidden">
+                  <button
+                    type="button"
+                    disabled={!selectedBlock || Boolean(selectedBlock.isWhiteoutOnly)}
+                    onClick={() =>
+                      selectedBlock &&
+                      handleUpdateBlock(selectedBlock.id, { isBold: !selectedBlock.isBold })
+                    }
+                    title="Bold"
+                    className={`px-2 py-1 font-bold disabled:opacity-40 ${
+                      selectedBlock?.isBold
+                        ? "bg-blue-600 text-white"
+                        : "text-slate-700 dark:text-slate-300 hover:bg-slate-200/60"
+                    }`}
+                  >
+                    <Bold className="h-3.5 w-3.5" />
+                  </button>
+                  <button
+                    type="button"
+                    disabled={!selectedBlock || Boolean(selectedBlock.isWhiteoutOnly)}
+                    onClick={() =>
+                      selectedBlock &&
+                      handleUpdateBlock(selectedBlock.id, { isItalic: !selectedBlock.isItalic })
+                    }
+                    title="Italic"
+                    className={`px-2 py-1 border-l border-slate-200 dark:border-slate-700 disabled:opacity-40 ${
+                      selectedBlock?.isItalic
+                        ? "bg-blue-600 text-white"
+                        : "text-slate-700 dark:text-slate-300 hover:bg-slate-200/60"
+                    }`}
+                  >
+                    <Italic className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+
+                {/* Text Alignment */}
+                <div className="hidden sm:inline-flex items-center rounded border border-slate-200 bg-slate-50 dark:border-slate-700 dark:bg-slate-800 overflow-hidden">
+                  {(
+                    [
+                      { id: "left", icon: AlignLeft, label: "Align Left" },
+                      { id: "center", icon: AlignCenter, label: "Align Center" },
+                      { id: "right", icon: AlignRight, label: "Align Right" },
+                    ] as const
+                  ).map((al) => {
+                    const Icon = al.icon;
+                    return (
+                      <button
+                        key={al.id}
+                        type="button"
+                        disabled={!selectedBlock || Boolean(selectedBlock.isWhiteoutOnly)}
+                        onClick={() =>
+                          selectedBlock &&
+                          handleUpdateBlock(selectedBlock.id, { textAlign: al.id })
+                        }
+                        title={al.label}
+                        className={`px-1.5 py-1 disabled:opacity-40 ${
+                          selectedBlock?.textAlign === al.id
+                            ? "bg-blue-600 text-white"
+                            : "text-slate-700 dark:text-slate-300 hover:bg-slate-200/60"
+                        }`}
+                      >
+                        <Icon className="h-3.5 w-3.5" />
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {/* Ink Color */}
+                <div className="flex items-center gap-1">
+                  <span className="text-slate-400 text-[11px]">Color:</span>
+                  <input
+                    type="color"
+                    disabled={!selectedBlock || Boolean(selectedBlock.isWhiteoutOnly)}
+                    value={selectedBlock ? selectedBlock.color : "#22252a"}
+                    onChange={(e) =>
+                      selectedBlock &&
+                      handleUpdateBlock(selectedBlock.id, { color: e.target.value })
+                    }
+                    title="Text Ink Color (Auto-matched to original PDF text)"
+                    className="h-5 w-6 cursor-pointer rounded border border-slate-300 bg-white p-0 disabled:opacity-40"
+                  />
+                </div>
+
+                {/* Mask Mode */}
+                {selectedBlock && (
+                  <div className="flex items-center gap-1 border-l border-slate-200 pl-2 dark:border-slate-700">
+                    <span className="text-slate-400 text-[11px]">Paper:</span>
+                    {(
+                      [
+                        { id: "auto", label: "Auto" },
+                        { id: "white", label: "White" },
+                        { id: "black", label: "Redact" },
+                      ] as const
+                    ).map((m) => (
+                      <button
+                        key={m.id}
+                        type="button"
+                        onClick={() => handleUpdateBlock(selectedBlock.id, { maskBg: m.id })}
+                        className={`rounded border px-1.5 py-0.5 text-[10px] font-semibold ${
+                          selectedBlock.maskBg === m.id
+                            ? "border-blue-600 bg-blue-50 text-blue-700 font-bold"
+                            : "border-slate-200 bg-white text-slate-600"
+                        }`}
+                      >
+                        {m.label}
+                      </button>
+                    ))}
+                  </div>
+                )}
+
+                {/* Restore / Blank Out when a block is selected */}
+                {selectedBlock && (
+                  <div className="flex items-center gap-1.5 border-l border-slate-200 pl-2 dark:border-slate-700">
+                    {!selectedBlock.isNew && isBlockModified(selectedBlock) && (
+                      <button
+                        type="button"
+                        onClick={() => handleRestoreOriginalBlock(selectedBlock.id)}
+                        className="inline-flex items-center gap-1 rounded border border-slate-200 bg-slate-50 px-2 py-0.5 text-[11px] font-medium text-slate-700 hover:bg-slate-100"
+                      >
+                        <RotateCcw className="h-3 w-3" />
+                        <span>Reset</span>
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => handleDeleteOrClearBlock(selectedBlock)}
+                      className="inline-flex items-center gap-1 rounded border border-red-200 bg-red-50 px-2 py-0.5 text-[11px] font-semibold text-red-600 hover:bg-red-100"
+                    >
+                      <Trash2 className="h-3 w-3" />
+                      <span>{selectedBlock.isNew ? "Delete" : "Erase"}</span>
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {/* Right Side of Ribbon: Zoom & Page Navigation */}
+              <div className="flex items-center gap-2 shrink-0">
+                <div className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-slate-50 px-1.5 py-0.5 dark:border-slate-800 dark:bg-slate-800">
+                  <button
+                    type="button"
+                    onClick={() => setZoomPercent((z) => Math.max(75, z - 25))}
+                    disabled={zoomPercent <= 75}
+                    title="Zoom Out"
+                    className="p-0.5 text-slate-600 hover:text-slate-900 disabled:opacity-30 dark:text-slate-300"
+                  >
+                    <ZoomOut className="h-3.5 w-3.5" />
+                  </button>
+                  <span className="font-mono text-[11px] font-bold text-slate-800 dark:text-slate-200 min-w-[38px] text-center">
+                    {zoomPercent}%
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setZoomPercent((z) => Math.min(200, z + 25))}
+                    disabled={zoomPercent >= 200}
+                    title="Zoom In"
+                    className="p-0.5 text-slate-600 hover:text-slate-900 disabled:opacity-30 dark:text-slate-300"
+                  >
+                    <ZoomIn className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+
+                <div className="flex items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={() => currentPage > 1 && setCurrentPage((p) => p - 1)}
+                    disabled={currentPage <= 1 || isRenderingPage}
+                    className="rounded border border-slate-200 p-1 text-slate-600 hover:bg-slate-100 disabled:opacity-30"
+                  >
+                    <ChevronLeft className="h-3.5 w-3.5" />
+                  </button>
+                  <span className="font-mono text-[11px] text-slate-900 dark:text-white font-bold px-1">
+                    {currentPage}/{totalPages}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => currentPage < totalPages && setCurrentPage((p) => p + 1)}
+                    disabled={currentPage >= totalPages || isRenderingPage}
+                    className="rounded border border-slate-200 p-1 text-slate-600 hover:bg-slate-100 disabled:opacity-30"
+                  >
+                    <ChevronRight className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {/* Optional Collapsible Find & Replace Bar */}
             {showFindReplace && (
-              <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white p-3 text-xs shadow-xs dark:border-slate-800 dark:bg-slate-900">
+              <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-slate-200 bg-white p-2.5 text-xs shadow-2xs dark:border-slate-800 dark:bg-slate-900">
                 <div className="flex flex-wrap items-center gap-2 flex-1">
                   <span className="font-bold text-slate-700 dark:text-slate-200 flex items-center gap-1">
-                    <Replace className="h-3.5 w-3.5 text-rose-600" />
+                    <Replace className="h-3.5 w-3.5 text-blue-600" />
                     <span>Find & Replace:</span>
                   </span>
 
-                  <div className="flex items-center gap-1.5 rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1.5 flex-1 min-w-[180px] dark:border-slate-700 dark:bg-slate-800">
+                  <div className="flex items-center gap-1.5 rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1 flex-1 min-w-[160px] dark:border-slate-700 dark:bg-slate-800">
                     <Search className="h-3.5 w-3.5 text-slate-400 shrink-0" />
                     <input
                       type="text"
                       value={findQuery}
                       onChange={(e) => setFindQuery(e.target.value)}
-                      placeholder="Click text or type to find..."
+                      placeholder="Find text..."
                       className="w-full bg-transparent text-xs text-slate-900 dark:text-white outline-none"
                     />
                     {findQuery && (
-                      <span className="rounded bg-rose-100 px-1.5 py-0.5 font-mono text-[10px] font-bold text-rose-700 shrink-0 dark:bg-rose-950 dark:text-rose-300">
-                        {matchingBlocks.length} match{matchingBlocks.length === 1 ? "" : "es"}
+                      <span className="rounded bg-blue-100 px-1.5 py-0.5 font-mono text-[10px] font-bold text-blue-700 shrink-0">
+                        {matchingBlocks.length}
                       </span>
                     )}
                   </div>
 
-                  <div className="flex items-center gap-1.5 rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1.5 flex-1 min-w-[180px] dark:border-slate-700 dark:bg-slate-800">
+                  <div className="flex items-center gap-1.5 rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1 flex-1 min-w-[160px] dark:border-slate-700 dark:bg-slate-800">
                     <Replace className="h-3.5 w-3.5 text-slate-400 shrink-0" />
                     <input
                       type="text"
@@ -2088,23 +2340,23 @@ export default function EditPdfPage() {
                     />
                   </div>
 
-                  <label className="inline-flex items-center gap-1.5 text-slate-600 dark:text-slate-400 cursor-pointer select-none px-1">
+                  <label className="inline-flex items-center gap-1 text-slate-600 dark:text-slate-400 cursor-pointer select-none px-1">
                     <input
                       type="checkbox"
                       checked={caseSensitiveFind}
                       onChange={(e) => setCaseSensitiveFind(e.target.checked)}
-                      className="rounded border-slate-300 text-rose-600 focus:ring-rose-500"
+                      className="rounded border-slate-300 text-blue-600"
                     />
                     <span>Match case</span>
                   </label>
                 </div>
 
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-1.5">
                   <button
                     type="button"
                     disabled={matchingBlocks.length === 0}
                     onClick={() => handleReplaceMatches("page")}
-                    className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 font-semibold text-slate-700 hover:bg-slate-100 disabled:opacity-40 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
+                    className="rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1 font-semibold text-slate-700 hover:bg-slate-100 disabled:opacity-40"
                   >
                     Replace Page
                   </button>
@@ -2112,373 +2364,41 @@ export default function EditPdfPage() {
                     type="button"
                     disabled={matchingBlocks.length === 0}
                     onClick={() => handleReplaceMatches("all")}
-                    className="rounded-lg bg-rose-600 px-3.5 py-1.5 font-bold text-white hover:bg-rose-500 disabled:opacity-40"
+                    className="rounded-lg bg-blue-600 px-3 py-1 font-bold text-white hover:bg-blue-500 disabled:opacity-40"
                   >
-                    Replace All ({matchingBlocks.length})
+                    Replace All
                   </button>
                 </div>
               </div>
             )}
 
             {/* Scanned / Image-Only PDF Detection Banner */}
-            {!isRenderingPage && detectedExistingLinesOnPage === 0 && (
-              <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-200 bg-amber-50/90 px-4 py-3 text-xs text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200">
-                <div className="flex items-center gap-2.5">
+            {!isRenderingPage && currentPageBlocks.filter((b) => !b.isNew).length === 0 && (
+              <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-200 bg-amber-50/90 px-4 py-2.5 text-xs text-amber-900">
+                <div className="flex items-center gap-2">
                   <ScanText className="h-4 w-4 text-amber-600 shrink-0" />
                   <span>
-                    <strong>No selectable text layer found on Page {currentPage}.</strong> This
-                    page appears to be a scanned image. You can still place{" "}
-                    <strong>+ Whiteout</strong> boxes and <strong>+ Add Text</strong> over any
-                    area, or run OCR first.
+                    <strong>Scanned image PDF detected on Page {currentPage}.</strong> Use{" "}
+                    <strong>+ Whiteout</strong> and <strong>+ Text</strong> above, or run OCR first.
                   </span>
                 </div>
                 <Link
                   href="/tools/ocr-pdf"
-                  className="inline-flex items-center gap-1 rounded-lg bg-amber-600 px-3 py-1.5 font-bold text-white hover:bg-amber-500 shrink-0"
+                  className="inline-flex items-center gap-1 rounded-lg bg-amber-600 px-3 py-1 font-bold text-white hover:bg-amber-500 shrink-0"
                 >
-                  <span>Open OCR PDF Tool →</span>
+                  <span>Open OCR Tool →</span>
                 </Link>
               </div>
             )}
 
-            {/* Selected Text Quick-Replace & Typography Inspector */}
-            {selectedBlock ? (
-              <div className="space-y-2.5 rounded-xl border border-rose-200 bg-rose-50/80 p-3.5 text-xs dark:border-rose-900/50 dark:bg-rose-950/30">
-                {!selectedBlock.isWhiteoutOnly && (
-                  <div className="flex flex-wrap items-center justify-between gap-2 border-b border-rose-200/70 pb-2.5 dark:border-rose-900/40">
-                    <div className="flex flex-wrap items-center gap-2 flex-1">
-                      <span className="font-bold text-rose-700 dark:text-rose-300 shrink-0">
-                        Selected Text:
-                      </span>
-
-                      <div className="flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 flex-1 min-w-[240px] dark:border-slate-700 dark:bg-slate-900">
-                        {selectedBlock.isMultiline ? (
-                          <textarea
-                            rows={2}
-                            value={selectedBlock.currentText}
-                            onChange={(e) => {
-                              const val = e.target.value;
-                              handleUpdateBlock(selectedBlock.id, { currentText: val });
-                              setSelectedReplaceSubstr(val);
-                              setReplaceQuery(val);
-                            }}
-                            placeholder="Type replacement paragraph text..."
-                            className="w-full bg-transparent text-xs font-medium text-slate-900 dark:text-white outline-none resize-y"
-                          />
-                        ) : (
-                          <input
-                            type="text"
-                            value={selectedBlock.currentText}
-                            onChange={(e) => {
-                              const val = e.target.value;
-                              handleUpdateBlock(selectedBlock.id, { currentText: val });
-                              setSelectedReplaceSubstr(val);
-                              setReplaceQuery(val);
-                            }}
-                            onKeyDown={(e) => {
-                              if (e.key === "Enter") {
-                                handleSelectBlock(null);
-                              }
-                            }}
-                            placeholder="Type new text..."
-                            className="w-full bg-transparent text-xs font-medium text-slate-900 dark:text-white outline-none"
-                          />
-                        )}
-                      </div>
-
-                      <button
-                        type="button"
-                        onClick={() => handleSelectBlock(null)}
-                        className="inline-flex items-center gap-1 rounded-lg bg-rose-600 hover:bg-rose-500 px-3 py-1.5 font-bold text-white shadow-xs"
-                      >
-                        <Check className="h-3.5 w-3.5" />
-                        <span>Apply & Preview</span>
-                      </button>
-                    </div>
-                  </div>
-                )}
-
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  <div className="flex flex-wrap items-center gap-2.5">
-                    <span className="font-bold text-rose-700 dark:text-rose-300 flex items-center gap-1">
-                      <Type className="h-3.5 w-3.5" />
-                      <span>
-                        {selectedBlock.isWhiteoutOnly ? "Whiteout / Redact:" : "Matched Style:"}
-                      </span>
-                    </span>
-
-                    {!selectedBlock.isWhiteoutOnly && (
-                      <>
-                        <select
-                          value={selectedBlock.fontFamily}
-                          onChange={(e) =>
-                            handleUpdateBlock(selectedBlock.id, {
-                              fontFamily: e.target.value as PdfFontFamily,
-                            })
-                          }
-                          aria-label="Font Family"
-                          className="rounded border border-slate-200 bg-white px-2 py-1 text-xs font-medium text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-white"
-                        >
-                          <option value="serif">Serif (LaTeX / Times / Georgia)</option>
-                          <option value="calibri">Calibri (Word Default)</option>
-                          <option value="sans">Arial / Helvetica (Sans)</option>
-                          <option value="mono">Courier (Monospace)</option>
-                        </select>
-
-                        <div className="flex items-center gap-1">
-                          <span className="text-slate-500">Size:</span>
-                          <input
-                            type="number"
-                            step="0.5"
-                            min={6}
-                            max={72}
-                            value={selectedBlock.fontSizePt}
-                            onChange={(e) =>
-                              handleUpdateBlock(selectedBlock.id, {
-                                fontSizePt: Math.max(6, Math.min(72, Number(e.target.value) || 11)),
-                              })
-                            }
-                            className="w-16 rounded border border-slate-200 bg-white px-2 py-1 font-mono text-xs text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-white"
-                          />
-                        </div>
-
-                        <div className="inline-flex items-center rounded border border-slate-200 bg-white dark:border-slate-700 dark:bg-slate-900 overflow-hidden">
-                          <button
-                            type="button"
-                            onClick={() =>
-                              handleUpdateBlock(selectedBlock.id, {
-                                isBold: !selectedBlock.isBold,
-                              })
-                            }
-                            title="Bold"
-                            className={`px-2 py-1 font-bold ${
-                              selectedBlock.isBold
-                                ? "bg-rose-600 text-white"
-                                : "text-slate-700 dark:text-slate-300 hover:bg-slate-100"
-                            }`}
-                          >
-                            <Bold className="h-3.5 w-3.5" />
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() =>
-                              handleUpdateBlock(selectedBlock.id, {
-                                isItalic: !selectedBlock.isItalic,
-                              })
-                            }
-                            title="Italic"
-                            className={`px-2 py-1 border-l border-slate-200 dark:border-slate-700 ${
-                              selectedBlock.isItalic
-                                ? "bg-rose-600 text-white"
-                                : "text-slate-700 dark:text-slate-300 hover:bg-slate-100"
-                            }`}
-                          >
-                            <Italic className="h-3.5 w-3.5" />
-                          </button>
-                        </div>
-
-                        <div className="inline-flex items-center rounded border border-slate-200 bg-white dark:border-slate-700 dark:bg-slate-900 overflow-hidden">
-                          {(
-                            [
-                              { id: "left", icon: AlignLeft, label: "Align Left" },
-                              { id: "center", icon: AlignCenter, label: "Align Center" },
-                              { id: "right", icon: AlignRight, label: "Align Right" },
-                            ] as const
-                          ).map((al) => {
-                            const Icon = al.icon;
-                            return (
-                              <button
-                                key={al.id}
-                                type="button"
-                                onClick={() =>
-                                  handleUpdateBlock(selectedBlock.id, { textAlign: al.id })
-                                }
-                                title={al.label}
-                                className={`px-2 py-1 ${
-                                  selectedBlock.textAlign === al.id
-                                    ? "bg-rose-600 text-white"
-                                    : "text-slate-700 dark:text-slate-300 hover:bg-slate-100"
-                                }`}
-                              >
-                                <Icon className="h-3.5 w-3.5" />
-                              </button>
-                            );
-                          })}
-                        </div>
-
-                        <div className="flex items-center gap-1.5">
-                          <span className="text-slate-500">Ink:</span>
-                          {[
-                            { hex: "#383a40", label: "Soft PDF Ink (LaTeX / Thin)" },
-                            { hex: "#1f242d", label: "Deep Charcoal / Bold" },
-                            { hex: "#1d4ed8", label: "Royal Blue" },
-                            { hex: "#dc2626", label: "Crimson Red" },
-                            { hex: "#059669", label: "Emerald Green" },
-                          ].map((c) => (
-                            <button
-                              key={c.hex}
-                              type="button"
-                              onClick={() =>
-                                handleUpdateBlock(selectedBlock.id, { color: c.hex })
-                              }
-                              style={{ backgroundColor: c.hex }}
-                              className={`h-5 w-5 rounded-full border-2 ${
-                                selectedBlock.color.toLowerCase() === c.hex
-                                  ? "border-rose-500 scale-110"
-                                  : "border-white"
-                              }`}
-                              title={c.label}
-                            />
-                          ))}
-                          <input
-                            type="color"
-                            value={selectedBlock.color}
-                            onChange={(e) =>
-                              handleUpdateBlock(selectedBlock.id, { color: e.target.value })
-                            }
-                            title="Custom Text Color (Auto-Sampled from PDF)"
-                            className="h-5 w-6 cursor-pointer rounded border border-slate-300 bg-white p-0"
-                          />
-                        </div>
-                      </>
-                    )}
-
-                    <div className="flex flex-wrap items-center gap-1">
-                      <span className="text-slate-500">Mask:</span>
-                      {(
-                        [
-                          { id: "auto", label: `Auto (${selectedBlock.autoBgHex})` },
-                          { id: "white", label: "White" },
-                          { id: "cream", label: "Warm" },
-                          { id: "black", label: "Redact" },
-                          ...(selectedBlock.isNew && !selectedBlock.isWhiteoutOnly
-                            ? [{ id: "transparent" as const, label: "None" }]
-                            : []),
-                        ] as const
-                      ).map((m) => (
-                        <button
-                          key={m.id}
-                          type="button"
-                          onClick={() => handleUpdateBlock(selectedBlock.id, { maskBg: m.id })}
-                          className={`rounded border px-2 py-0.5 text-[11px] font-semibold ${
-                            selectedBlock.maskBg === m.id
-                              ? "border-rose-600 bg-white text-rose-600 font-bold"
-                              : "border-slate-200 bg-white/70 text-slate-600"
-                          }`}
-                        >
-                          {m.label}
-                        </button>
-                      ))}
-                      <input
-                        type="color"
-                        value={
-                          selectedBlock.maskBg === "custom"
-                            ? selectedBlock.customMaskHex
-                            : selectedBlock.autoBgHex
-                        }
-                        onChange={(e) =>
-                          handleUpdateBlock(selectedBlock.id, {
-                            maskBg: "custom",
-                            customMaskHex: e.target.value,
-                          })
-                        }
-                        title="Custom Mask Background Color"
-                        className="h-5 w-6 cursor-pointer rounded border border-slate-300 bg-white p-0"
-                      />
-                    </div>
-                  </div>
-
-                  <div className="flex items-center gap-2">
-                    {!selectedBlock.isNew && isBlockModified(selectedBlock) && (
-                      <button
-                        type="button"
-                        onClick={() => handleRestoreOriginalBlock(selectedBlock.id)}
-                        className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-slate-600 hover:text-slate-900"
-                      >
-                        <RotateCcw className="h-3 w-3" />
-                        <span>Restore Original</span>
-                      </button>
-                    )}
-
-                    <button
-                      type="button"
-                      onClick={() => handleDeleteOrClearBlock(selectedBlock)}
-                      className="inline-flex items-center gap-1 rounded-lg border border-red-200 bg-red-50 px-2.5 py-1 font-semibold text-red-600 hover:bg-red-100"
-                    >
-                      <Trash2 className="h-3 w-3" />
-                      <span>{selectedBlock.isNew ? "Delete Box" : "Blank Out"}</span>
-                    </button>
-                  </div>
-                </div>
-              </div>
-            ) : (
-              <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-xs text-slate-600 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-400">
-                <span className="flex items-center gap-2 font-medium">
-                  <Sparkles className="h-4 w-4 text-rose-600 shrink-0" />
-                  <span>
-                    <strong>Drag a box over any exact words</strong> you want to edit, or hover by{" "}
-                    <strong>Word / Line / Paragraph</strong> using the top selector.
-                  </span>
-                </span>
-
-                <div className="flex items-center gap-3 shrink-0">
-                  <div className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-slate-50 px-1.5 py-0.5 dark:border-slate-800 dark:bg-slate-800">
-                    <button
-                      type="button"
-                      onClick={() => setZoomPercent((z) => Math.max(75, z - 25))}
-                      disabled={zoomPercent <= 75}
-                      title="Zoom Out"
-                      className="p-1 text-slate-600 hover:text-slate-900 disabled:opacity-30 dark:text-slate-300"
-                    >
-                      <ZoomOut className="h-3.5 w-3.5" />
-                    </button>
-                    <span className="font-mono text-[11px] font-bold text-slate-800 dark:text-slate-200 min-w-[40px] text-center">
-                      {zoomPercent}%
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => setZoomPercent((z) => Math.min(200, z + 25))}
-                      disabled={zoomPercent >= 200}
-                      title="Zoom In"
-                      className="p-1 text-slate-600 hover:text-slate-900 disabled:opacity-30 dark:text-slate-300"
-                    >
-                      <ZoomIn className="h-3.5 w-3.5" />
-                    </button>
-                  </div>
-
-                  <div className="flex items-center gap-1.5">
-                    <button
-                      type="button"
-                      onClick={() => currentPage > 1 && setCurrentPage((p) => p - 1)}
-                      disabled={currentPage <= 1 || isRenderingPage}
-                      className="rounded-lg border border-slate-200 p-1.5 text-slate-600 hover:bg-slate-100 dark:border-slate-800 dark:text-slate-400 disabled:opacity-30"
-                    >
-                      <ChevronLeft className="h-4 w-4" />
-                    </button>
-                    <span className="font-mono text-slate-900 dark:text-white font-bold">
-                      {currentPage} / {totalPages}
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => currentPage < totalPages && setCurrentPage((p) => p + 1)}
-                      disabled={currentPage >= totalPages || isRenderingPage}
-                      className="rounded-lg border border-slate-200 p-1.5 text-slate-600 hover:bg-slate-100 dark:border-slate-800 dark:text-slate-400 disabled:opacity-30"
-                    >
-                      <ChevronRight className="h-4 w-4" />
-                    </button>
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {/* Interactive PDF Page Viewport (Supports Click-on-Hover AND Drag-Marquee Selection!) */}
+            {/* Word-Document Style Page Canvas */}
             <div
               onPointerDown={handleViewportPointerDown}
-              className="relative block overflow-auto rounded-2xl border border-slate-200 bg-slate-100 p-4 max-h-[82vh] cursor-crosshair dark:border-slate-800 dark:bg-slate-950"
+              className="relative block overflow-auto rounded-2xl border border-slate-200 bg-slate-200/70 p-4 sm:p-6 max-h-[82vh] cursor-text dark:border-slate-800 dark:bg-slate-950"
             >
               {isRenderingPage && (
                 <div className="absolute inset-0 z-30 flex items-center justify-center bg-white/60 dark:bg-slate-950/60 backdrop-blur-2xs">
-                  <Loader2 className="h-6 w-6 animate-spin text-rose-600" />
+                  <Loader2 className="h-6 w-6 animate-spin text-blue-600" />
                 </div>
               )}
 
@@ -2488,22 +2408,24 @@ export default function EditPdfPage() {
                   width: `${Math.round(pageBaseSizePt.width * 1.35 * (zoomPercent / 100))}px`,
                   maxWidth: zoomPercent > 100 ? "none" : "100%",
                 }}
-                className="relative mx-auto block h-fit select-none shadow-xl border border-slate-200/80 bg-white leading-none antialiased"
+                className="relative mx-auto block h-fit select-none shadow-2xl border border-slate-300/80 bg-white leading-none antialiased"
               >
-                <canvas ref={pdfCanvasRef} className="block w-full h-auto rounded-xs" />
+                <canvas ref={pdfCanvasRef} className="block w-full h-auto" />
 
-                {/* Live Drag-to-Select Marquee Rectangle */}
-                {marqueeRect && (
-                  <div
-                    style={{
-                      left: `${Math.min(marqueeRect.startX, marqueeRect.curX)}%`,
-                      top: `${Math.min(marqueeRect.startY, marqueeRect.curY)}%`,
-                      width: `${Math.abs(marqueeRect.curX - marqueeRect.startX)}%`,
-                      height: `${Math.abs(marqueeRect.curY - marqueeRect.startY)}%`,
-                    }}
-                    className="pointer-events-none absolute z-40 border-2 border-rose-600 bg-rose-500/15 rounded-xs"
-                  />
-                )}
+                {/* Live Drag-Select Marquee Rectangle */}
+                {marqueeRect &&
+                  (Math.abs(marqueeRect.curX - marqueeRect.startX) > 1.2 ||
+                    Math.abs(marqueeRect.curY - marqueeRect.startY) > 1.0) && (
+                    <div
+                      style={{
+                        left: `${Math.min(marqueeRect.startX, marqueeRect.curX)}%`,
+                        top: `${Math.min(marqueeRect.startY, marqueeRect.curY)}%`,
+                        width: `${Math.abs(marqueeRect.curX - marqueeRect.startX)}%`,
+                        height: `${Math.abs(marqueeRect.curY - marqueeRect.startY)}%`,
+                      }}
+                      className="pointer-events-none absolute z-40 border border-blue-600 bg-blue-500/15"
+                    />
+                  )}
 
                 {currentPageBlocks.map((block) => {
                   const isSelected = !previewCleanMode && selectedBlockId === block.id;
@@ -2520,7 +2442,7 @@ export default function EditPdfPage() {
                   }
 
                   const maskHex = resolveMaskHex(block);
-                  const scaledFontPx = Math.max(8.5, block.fontSizePt * displayScale);
+                  const scaledFontPx = Math.max(8, block.fontSizePt * displayScale);
                   const scaledLineHeightPx =
                     (block.lineHeightPt || block.fontSizePt * 1.3) * displayScale;
 
@@ -2556,50 +2478,43 @@ export default function EditPdfPage() {
                               ? "flex-end"
                               : "flex-start",
                       }}
-                      className={`group absolute flex items-start transition-shadow rounded-xs ${
+                      className={`group absolute flex items-start rounded-[1px] transition-colors ${
                         isSelected
-                          ? "z-30 ring-2 ring-rose-600 shadow-md"
+                          ? "z-30 ring-1 ring-blue-500/60"
                           : isFindHit
-                            ? "z-25 ring-2 ring-amber-500 bg-amber-200/30"
-                            : isModified
-                              ? "z-20 border border-dashed border-emerald-500/70 hover:border-rose-500 cursor-pointer"
-                              : "z-10 border border-transparent hover:border-dashed hover:border-rose-400 hover:bg-rose-500/10 cursor-text"
+                            ? "z-25 bg-amber-300/35 ring-1 ring-amber-500"
+                            : "z-10 hover:bg-blue-500/[0.06] cursor-text"
                       }`}
                     >
+                      {/* Unobtrusive left drag handle & corner resize handle only when selected */}
                       {isSelected && (
                         <>
                           <button
                             type="button"
                             onPointerDown={(e) => handleStartInteraction(block, "drag", e)}
                             title="Drag to move"
-                            className="absolute -top-5 left-0 z-40 inline-flex items-center gap-0.5 rounded-t bg-rose-600 px-1.5 py-0.5 text-[9px] font-mono font-bold text-white cursor-move shadow-xs"
+                            className="absolute -left-4 top-0 z-40 flex h-4 w-3.5 items-center justify-center rounded-l bg-blue-600 text-white opacity-75 hover:opacity-100 cursor-move"
                           >
                             <Move className="h-2.5 w-2.5" />
-                            <span>Move</span>
                           </button>
 
                           <div
                             onPointerDown={(e) => handleStartInteraction(block, "resize", e)}
-                            title="Drag corner to resize box"
-                            className="absolute -bottom-1.5 -right-1.5 z-40 h-3 w-3 rounded-xs border border-white bg-rose-600 cursor-nwse-resize shadow-xs"
+                            title="Resize"
+                            className="absolute -bottom-1 -right-1 z-40 h-2.5 w-2.5 border border-white bg-blue-600 cursor-nwse-resize"
                           />
                         </>
                       )}
 
                       {block.isWhiteoutOnly ? (
-                        <div className="w-full h-full min-h-[16px] cursor-move flex items-center justify-center text-[9px] font-mono text-slate-400">
-                          {isSelected ? "Drag or Resize Mask" : ""}
-                        </div>
+                        <div className="w-full h-full min-h-[14px] cursor-move" />
                       ) : isSelected && block.isMultiline ? (
                         <textarea
                           autoFocus
                           rows={Math.max(2, block.currentText.split("\n").length)}
                           value={block.currentText}
                           onChange={(e) => {
-                            const val = e.target.value;
-                            handleUpdateBlock(block.id, { currentText: val });
-                            setSelectedReplaceSubstr(val);
-                            setReplaceQuery(val);
+                            handleUpdateBlock(block.id, { currentText: e.target.value });
                           }}
                           style={{
                             color: block.color,
@@ -2610,9 +2525,10 @@ export default function EditPdfPage() {
                             lineHeight: `${scaledLineHeightPx}px`,
                             textAlign: block.textAlign,
                           }}
-                          className="w-full min-w-full bg-transparent outline-none px-0.5 resize-none antialiased"
+                          className="w-full min-w-full bg-transparent outline-none p-0 m-0 resize-none antialiased selection:bg-blue-500/20"
                         />
                       ) : isSelected ? (
+                        /* Seamless Word-like inline input that expands naturally as you type */
                         <div className="inline-grid w-full items-center">
                           <span
                             aria-hidden="true"
@@ -2622,7 +2538,7 @@ export default function EditPdfPage() {
                               fontStyle: block.isItalic ? "italic" : "normal",
                               fontSize: `${scaledFontPx}px`,
                             }}
-                            className="invisible col-start-1 row-start-1 whitespace-pre px-2 pointer-events-none select-none leading-none"
+                            className="invisible col-start-1 row-start-1 whitespace-pre pr-2 pointer-events-none select-none leading-none"
                           >
                             {block.currentText || " "}
                           </span>
@@ -2630,18 +2546,19 @@ export default function EditPdfPage() {
                             type="text"
                             autoFocus
                             value={block.currentText}
-                            onFocus={(e) => {
-                              e.currentTarget.scrollLeft = 0;
-                            }}
                             onChange={(e) => {
-                              const val = e.target.value;
-                              handleUpdateBlock(block.id, { currentText: val });
-                              setSelectedReplaceSubstr(val);
-                              setReplaceQuery(val);
+                              handleUpdateBlock(block.id, { currentText: e.target.value });
                             }}
                             onKeyDown={(e) => {
                               if (e.key === "Enter") {
-                                handleSelectBlock(null);
+                                e.preventDefault();
+                                handleNavigateLine("down");
+                              } else if (e.key === "ArrowDown") {
+                                e.preventDefault();
+                                handleNavigateLine("down");
+                              } else if (e.key === "ArrowUp") {
+                                e.preventDefault();
+                                handleNavigateLine("up");
                               }
                             }}
                             style={{
@@ -2652,10 +2569,11 @@ export default function EditPdfPage() {
                               fontSize: `${scaledFontPx}px`,
                               textAlign: block.textAlign,
                             }}
-                            className="col-start-1 row-start-1 w-full min-w-full bg-transparent outline-none leading-none px-0.5 antialiased"
+                            className="col-start-1 row-start-1 w-full min-w-full bg-transparent outline-none leading-none p-0 m-0 antialiased selection:bg-blue-500/20"
                           />
                         </div>
                       ) : isModified ? (
+                        /* Invisible sizer keeps the hit-box matching the edited text width with zero visible border clutter */
                         <span
                           aria-hidden="true"
                           style={{
@@ -2664,18 +2582,11 @@ export default function EditPdfPage() {
                             fontStyle: block.isItalic ? "italic" : "normal",
                             fontSize: `${scaledFontPx}px`,
                           }}
-                          className="invisible whitespace-pre px-1 pointer-events-none select-none leading-none"
+                          className="invisible whitespace-pre pr-1 pointer-events-none select-none leading-none"
                         >
                           {block.currentText.split("\n")[0] || " "}
                         </span>
-                      ) : (
-                        <span
-                          title={`Click to edit ${selectionGranularity}: "${block.currentText}"`}
-                          className="w-full h-full block opacity-0 group-hover:opacity-100 text-[9px] font-mono bg-rose-600 text-white px-1 rounded-xs pointer-events-none truncate max-w-[90px]"
-                        >
-                          Edit
-                        </span>
-                      )}
+                      ) : null}
                     </div>
                   );
                 })}
@@ -2683,54 +2594,18 @@ export default function EditPdfPage() {
             </div>
 
             {errorMessage && (
-              <div className="flex items-start gap-2.5 rounded-xl border border-red-200 bg-red-50 p-3.5 text-xs text-red-700">
+              <div className="flex items-start gap-2.5 rounded-xl border border-red-200 bg-red-50 p-3 text-xs text-red-700">
                 <AlertCircle className="h-4 w-4 shrink-0 text-red-600 mt-0.5" />
                 <span>{errorMessage}</span>
               </div>
             )}
 
             {successMessage && (
-              <div className="flex items-start gap-2.5 rounded-xl border border-emerald-200 bg-emerald-50 p-3.5 text-xs text-emerald-700">
+              <div className="flex items-start gap-2.5 rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-xs text-emerald-700">
                 <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600 mt-0.5" />
                 <span>{successMessage}</span>
               </div>
             )}
-
-            {/* Bottom Save & Shortcut Bar */}
-            <div className="flex flex-col sm:flex-row items-center justify-between gap-4 pt-2 border-t border-slate-200 dark:border-slate-800">
-              <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500 dark:text-slate-400 font-medium">
-                <span>
-                  {modifiedBlocks.length > 0
-                    ? `${modifiedBlocks.length} text change(s) applied live on page and ready to download.`
-                    : "Drag over any exact words to edit just that selection, or click any Word / Line / Paragraph."}
-                </span>
-                <span className="hidden md:inline font-mono text-[11px] text-slate-400">
-                  • Shortcuts: Drag = Select Custom Amount • Enter = Apply • Ctrl+Z = Undo
-                </span>
-              </div>
-
-              <button
-                type="button"
-                onClick={handleSaveEditedPdf}
-                disabled={isSaving}
-                className="w-full sm:w-auto inline-flex items-center justify-center gap-2 rounded-xl bg-rose-600 hover:bg-rose-500 px-6 py-2.5 text-sm font-semibold text-white shadow-md shadow-rose-600/20 disabled:opacity-40 transition-all"
-              >
-                {isSaving ? (
-                  <>
-                    <Loader2 className="h-4 w-4 animate-spin text-white" />
-                    <span>Saving Edited PDF...</span>
-                  </>
-                ) : (
-                  <>
-                    <Download className="h-4 w-4 text-white" />
-                    <span>
-                      Save & Download Edited PDF
-                      {modifiedBlocks.length > 0 ? ` (${modifiedBlocks.length})` : ""}
-                    </span>
-                  </>
-                )}
-              </button>
-            </div>
           </div>
         )}
       </div>
