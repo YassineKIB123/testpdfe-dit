@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://pdftool.fenangplay.workers.dev/sitemap.xml
