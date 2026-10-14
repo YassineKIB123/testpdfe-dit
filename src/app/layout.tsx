@@ -1,11 +1,14 @@
 import type { Metadata } from "next";
 import { Inter } from "next/font/google";
+import Script from "next/script";
 import "./globals.css";
 import { LanguageProvider } from "@/context/LanguageContext";
 
 const inter = Inter({ subsets: ["latin", "cyrillic"] });
 
-const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL || "https://pdftool.fenangplay.workers.dev";
+const SITE_URL =
+  process.env.NEXT_PUBLIC_SITE_URL || "https://pdftool.fenangplay.workers.dev";
+const ADSENSE_ID = process.env.NEXT_PUBLIC_ADSENSE_ID || "";
 
 export const metadata: Metadata = {
   metadataBase: new URL(SITE_URL),
@@ -17,9 +20,10 @@ export const metadata: Metadata = {
     template: "%s | PDFStudio",
   },
   description:
-    "Every PDF tool you need, all in one place. Merge, split, compress, scan, sign, convert, and rotate PDFs with 100% client-side browser privacy. Your files never leave your device.",
+    "Every PDF tool you need, all in one place. Edit, merge, split, compress, scan, sign, convert, and rotate PDFs with 100% client-side browser privacy. Your files never leave your device.",
   keywords: [
     "PDF tools",
+    "edit PDF text online",
     "free PDF merge",
     "compress PDF under 100kb",
     "PDF scanner",
@@ -43,7 +47,8 @@ export const metadata: Metadata = {
   twitter: {
     card: "summary_large_image",
     title: "PDFStudio — Free & 100% Private PDF Tools",
-    description: "Scan, Sign, Compress, Merge, Split, and Convert PDFs client-side without servers.",
+    description:
+      "Edit, Scan, Sign, Compress, Merge, Split, and Convert PDFs client-side without servers.",
   },
   robots: {
     index: true,
@@ -73,13 +78,15 @@ export default function RootLayout({
     url: SITE_URL,
     applicationCategory: "BusinessApplication",
     operatingSystem: "All",
-    browserRequirements: "Requires modern web browser with WebAssembly and HTML5 Canvas support",
+    browserRequirements:
+      "Requires modern web browser with WebAssembly and HTML5 Canvas support",
     offers: {
       "@type": "Offer",
       price: "0",
       priceCurrency: "USD",
     },
     featureList: [
+      "Sejda-Style In-Place PDF Text Editor",
       "Mobile and Web Camera Document Scanner with Auto-Edge Detection",
       "Multi-Level PDF Compression (Extreme, Recommended, Lossless)",
       "Digital Electronic PDF Signing, Stamps & Initials",
@@ -96,8 +103,19 @@ export default function RootLayout({
           type="application/ld+json"
           dangerouslySetInnerHTML={{ __html: JSON.stringify(jsonLd) }}
         />
+        {ADSENSE_ID && (
+          <Script
+            id="adsense-init"
+            async
+            strategy="afterInteractive"
+            src={`https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=${ADSENSE_ID}`}
+            crossOrigin="anonymous"
+          />
+        )}
       </head>
-      <body className={`${inter.className} min-h-screen bg-white text-slate-900 dark:bg-slate-950 dark:text-slate-100 antialiased`}>
+      <body
+        className={`${inter.className} min-h-screen bg-white text-slate-900 dark:bg-slate-950 dark:text-slate-100 antialiased`}
+      >
         <LanguageProvider>{children}</LanguageProvider>
       </body>
     </html>

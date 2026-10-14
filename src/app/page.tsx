@@ -1112,7 +1112,12 @@ export default function HomePage() {
           </div>
 
           <div className="mt-10 flex flex-col sm:flex-row items-center justify-between border-t border-slate-200 dark:border-slate-800 pt-6 gap-4 text-slate-500">
-            <p>PDFStudio &copy; 2026. {t.footer.rights}</p>
+            <div className="flex flex-wrap items-center gap-4">
+              <p>PDFStudio &copy; 2026. {t.footer.rights}</p>
+              <Link href="/privacy" className="hover:text-rose-600 underline-offset-4 hover:underline">Privacy Policy</Link>
+              <Link href="/terms" className="hover:text-rose-600 underline-offset-4 hover:underline">Terms of Service</Link>
+              <Link href="/contact" className="hover:text-rose-600 underline-offset-4 hover:underline">Contact</Link>
+            </div>
 
             <div className="flex items-center gap-1.5 font-medium">
               {(["EN", "FR", "ES", "RU", "AR"] as const).map((lang) => (
