@@ -2,7 +2,6 @@
 
 import React, { useState, useMemo, useEffect, useRef } from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
 import {
   Camera,
   PenLine,
@@ -100,7 +99,6 @@ const POPULAR_PSEO_LINKS = [
 ];
 
 export default function HomePage() {
-  const router = useRouter();
   const [searchQuery, setSearchQuery] = useState("");
   const [activeCategory, setActiveCategory] = useState<CategoryFilter>("all");
   const {
@@ -113,10 +111,11 @@ export default function HomePage() {
   const [isMegaMenuOpen, setIsMegaMenuOpen] = useState(false);
   const [openFaqIndex, setOpenFaqIndex] = useState<number | null>(null);
 
-  // Hero Dropzone & Tool Selector States
+  // Hero Dropzone States & Ref to the Main Tools Section below
   const [droppedFiles, setDroppedFiles] = useState<File[]>([]);
   const [isDraggingHero, setIsDraggingHero] = useState(false);
   const heroFileInputRef = useRef<HTMLInputElement>(null);
+  const toolsSectionRef = useRef<HTMLDivElement>(null);
 
   // PWA Install Prompt States
   const [deferredPrompt, setDeferredPrompt] = useState<any>(null);
@@ -169,20 +168,21 @@ export default function HomePage() {
     }
   };
 
+  // When a PDF or Image is dropped/selected, save it and smoothly scroll right down to the Tools Grid below!
   const handleHeroFilesPicked = (fileList: FileList | File[]) => {
     const arr = Array.from(fileList);
     if (arr.length === 0) return;
     setDroppedFiles(arr);
+    setActiveCategory("all");
     if (typeof window !== "undefined") {
       window.__pdfStudioPendingFiles = arr;
     }
-  };
-
-  const handleLaunchToolWithFile = (href: string) => {
-    if (typeof window !== "undefined" && droppedFiles.length > 0) {
-      window.__pdfStudioPendingFiles = droppedFiles;
-    }
-    router.push(href);
+    setTimeout(() => {
+      toolsSectionRef.current?.scrollIntoView({
+        behavior: "smooth",
+        block: "start",
+      });
+    }, 80);
   };
 
   const t = DICTIONARY[selectedLanguage] || DICTIONARY.EN;
@@ -621,13 +621,13 @@ export default function HomePage() {
           </p>
 
           {/* ================================================================ */}
-          {/* HERO "DROP YOUR PDF HERE" INTERACTIVE LAUNCHER                   */}
+          {/* HERO "DROP PDF OR IMG" DROPZONE (SCROLLS TO MAIN TOOLS BELOW)    */}
           {/* ================================================================ */}
           <div className="pt-2 max-w-2xl mx-auto">
             <input
               ref={heroFileInputRef}
               type="file"
-              accept=".pdf,application/pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.jpg,.jpeg,.png,.webp"
+              accept=".pdf,application/pdf,.jpg,.jpeg,.png,.webp,.doc,.docx,.xls,.xlsx,.ppt,.pptx"
               multiple
               onChange={(e) => {
                 if (e.target.files && e.target.files.length > 0) {
@@ -638,241 +638,191 @@ export default function HomePage() {
               className="hidden"
             />
 
-            {droppedFiles.length === 0 ? (
-              <div
-                onClick={() => heroFileInputRef.current?.click()}
-                onDragOver={(e) => {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  setIsDraggingHero(true);
-                }}
-                onDragLeave={(e) => {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  setIsDraggingHero(false);
-                }}
-                onDrop={(e) => {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  setIsDraggingHero(false);
-                  if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-                    handleHeroFilesPicked(e.dataTransfer.files);
-                  }
-                }}
-                role="button"
-                tabIndex={0}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" || e.key === " ") {
-                    heroFileInputRef.current?.click();
-                  }
-                }}
-                className={`group relative overflow-hidden rounded-3xl border-2 border-dashed p-7 sm:p-9 transition-all duration-300 cursor-pointer shadow-lg ${
-                  isDraggingHero
-                    ? "border-rose-500 bg-rose-50/90 scale-[1.01] shadow-rose-500/20 dark:border-rose-500 dark:bg-rose-950/30"
-                    : "border-rose-300/90 bg-gradient-to-br from-rose-50/70 via-white to-orange-50/50 hover:border-rose-500 hover:shadow-xl hover:shadow-rose-500/10 dark:border-rose-900/60 dark:from-slate-900 dark:via-slate-900 dark:to-rose-950/20"
-                }`}
-              >
-                {/* Subtle decorative background glow */}
-                <div className="pointer-events-none absolute -right-12 -top-12 h-36 w-36 rounded-full bg-rose-500/10 blur-2xl transition-transform group-hover:scale-125" />
-                <div className="pointer-events-none absolute -bottom-12 -left-12 h-36 w-36 rounded-full bg-orange-500/10 blur-2xl transition-transform group-hover:scale-125" />
+            <div
+              onClick={() => heroFileInputRef.current?.click()}
+              onDragOver={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                setIsDraggingHero(true);
+              }}
+              onDragLeave={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                setIsDraggingHero(false);
+              }}
+              onDrop={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                setIsDraggingHero(false);
+                if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                  handleHeroFilesPicked(e.dataTransfer.files);
+                }
+              }}
+              role="button"
+              tabIndex={0}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  heroFileInputRef.current?.click();
+                }
+              }}
+              className={`group relative overflow-hidden rounded-3xl border-2 border-dashed p-7 sm:p-9 transition-all duration-300 cursor-pointer shadow-lg ${
+                isDraggingHero
+                  ? "border-rose-500 bg-rose-50/90 scale-[1.01] shadow-rose-500/20 dark:border-rose-500 dark:bg-rose-950/30"
+                  : "border-rose-300/90 bg-gradient-to-br from-rose-50/70 via-white to-orange-50/50 hover:border-rose-500 hover:shadow-xl hover:shadow-rose-500/10 dark:border-rose-900/60 dark:from-slate-900 dark:via-slate-900 dark:to-rose-950/20"
+              }`}
+            >
+              {/* Subtle decorative background glow */}
+              <div className="pointer-events-none absolute -right-12 -top-12 h-36 w-36 rounded-full bg-rose-500/10 blur-2xl transition-transform group-hover:scale-125" />
+              <div className="pointer-events-none absolute -bottom-12 -left-12 h-36 w-36 rounded-full bg-orange-500/10 blur-2xl transition-transform group-hover:scale-125" />
 
-                <div className="relative flex flex-col items-center justify-center space-y-3.5">
-                  <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-rose-600 to-orange-500 text-white shadow-md shadow-rose-600/25 transition-transform duration-300 group-hover:scale-110 group-hover:-rotate-3">
-                    <UploadCloud className="h-8 w-8" />
-                  </div>
+              <div className="relative flex flex-col items-center justify-center space-y-3.5">
+                <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-rose-600 to-orange-500 text-white shadow-md shadow-rose-600/25 transition-transform duration-300 group-hover:scale-110 group-hover:-rotate-3">
+                  <UploadCloud className="h-8 w-8" />
+                </div>
 
-                  <div className="space-y-1">
-                    <span className="inline-flex items-center gap-1.5 rounded-full bg-rose-100/90 dark:bg-rose-950/70 px-3 py-0.5 text-[11px] font-extrabold uppercase tracking-wider text-rose-700 dark:text-rose-300">
-                      <Sparkles className="h-3 w-3" />
-                      <span>Instant Tool Launcher</span>
-                    </span>
-                    <h2 className="text-xl sm:text-2xl font-black tracking-tight text-slate-900 dark:text-white">
-                      DROP YOUR PDF HERE
-                    </h2>
-                    <p className="text-xs sm:text-sm text-slate-500 dark:text-slate-400">
-                      Drag & drop your PDF (or click to browse) — then pick any tool to open it immediately
-                    </p>
-                  </div>
+                <div className="space-y-1">
+                  <span className="inline-flex items-center gap-1.5 rounded-full bg-rose-100/90 dark:bg-rose-950/70 px-3 py-0.5 text-[11px] font-extrabold uppercase tracking-wider text-rose-700 dark:text-rose-300">
+                    <Sparkles className="h-3 w-3" />
+                    <span>Instant File Drop</span>
+                  </span>
+                  <h2 className="text-xl sm:text-2xl font-black tracking-tight uppercase text-slate-900 dark:text-white">
+                    DROP PDF OR IMG
+                  </h2>
+                  <p className="text-xs sm:text-sm text-slate-500 dark:text-slate-400">
+                    Drag & drop your PDF or image here — then pick any tool below to open it right away
+                  </p>
+                </div>
 
-                  <div className="pt-1 flex flex-wrap items-center justify-center gap-3">
-                    <span className="inline-flex items-center gap-2 rounded-xl bg-rose-600 group-hover:bg-rose-500 px-5 py-2.5 text-xs sm:text-sm font-bold text-white shadow-sm shadow-rose-600/20 transition-all">
-                      <FileText className="h-4 w-4" />
-                      <span>Select PDF File</span>
-                      <ArrowRight className="h-4 w-4 transition-transform group-hover:translate-x-0.5" />
-                    </span>
+                <div className="pt-1 flex flex-wrap items-center justify-center gap-3">
+                  <span className="inline-flex items-center gap-2 rounded-xl bg-rose-600 group-hover:bg-rose-500 px-5 py-2.5 text-xs sm:text-sm font-bold text-white shadow-sm shadow-rose-600/20 transition-all">
+                    <FileText className="h-4 w-4" />
+                    <span>Select PDF or Image</span>
+                    <ArrowRight className="h-4 w-4 transition-transform group-hover:translate-x-0.5" />
+                  </span>
 
-                    <span className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200/90 bg-white/90 dark:border-slate-800 dark:bg-slate-900 px-3 py-2 text-[11px] font-semibold text-slate-600 dark:text-slate-300">
-                      <ShieldCheck className="h-3.5 w-3.5 text-emerald-600" />
-                      <span>100% Local & Private</span>
-                    </span>
-                  </div>
+                  <span className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200/90 bg-white/90 dark:border-slate-800 dark:bg-slate-900 px-3 py-2 text-[11px] font-semibold text-slate-600 dark:text-slate-300">
+                    <ShieldCheck className="h-3.5 w-3.5 text-emerald-600" />
+                    <span>100% Local & Private</span>
+                  </span>
                 </div>
               </div>
-            ) : (
-              /* ============================================================== */
-              /* FILE DROPPED -> INTERACTIVE TOOL SELECTOR LAUNCHER             */
-              /* ============================================================== */
-              <div className="rounded-3xl border-2 border-rose-500/80 bg-white dark:bg-slate-900 p-5 sm:p-6 shadow-2xl shadow-rose-500/10 text-left space-y-5">
-                <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 dark:border-slate-800 pb-4">
-                  <div className="flex items-center gap-3">
-                    <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-emerald-50 text-emerald-600 border border-emerald-200 dark:bg-emerald-950/50 dark:border-emerald-800 dark:text-emerald-400">
-                      <CheckCircle2 className="h-6 w-6" />
-                    </div>
-                    <div>
-                      <div className="flex items-center gap-2">
-                        <h3 className="text-sm sm:text-base font-extrabold text-slate-900 dark:text-white truncate max-w-[220px] sm:max-w-md">
-                          {droppedFiles[0].name}
-                        </h3>
-                        {droppedFiles.length > 1 && (
-                          <span className="rounded-full bg-rose-100 px-2 py-0.5 text-[10px] font-bold text-rose-700 dark:bg-rose-950 dark:text-rose-300">
-                            +{droppedFiles.length - 1} more
-                          </span>
-                        )}
-                      </div>
-                      <p className="text-xs text-slate-500 dark:text-slate-400">
-                        {formatFileSize(
-                          droppedFiles.reduce((acc, f) => acc + f.size, 0)
-                        )}{" "}
-                        • Ready in browser memory — choose a tool below to open directly:
-                      </p>
-                    </div>
-                  </div>
+            </div>
+          </div>
 
-                  <div className="flex items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={() => heroFileInputRef.current?.click()}
-                      className="rounded-xl border border-slate-200 bg-slate-50 hover:bg-slate-100 dark:border-slate-800 dark:bg-slate-800 px-3 py-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200 transition-colors"
-                    >
-                      Change File
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setDroppedFiles([]);
-                        if (typeof window !== "undefined") {
-                          window.__pdfStudioPendingFiles = null;
-                        }
-                      }}
-                      className="rounded-xl border border-slate-200 bg-white hover:bg-red-50 hover:text-red-600 hover:border-red-200 dark:border-slate-800 dark:bg-slate-900 p-1.5 text-slate-400 transition-colors"
-                      title="Remove file"
-                    >
-                      <X className="h-4 w-4" />
-                    </button>
+          {/* ================================================================ */}
+          {/* MAIN TOOLS SECTION ANCHOR (AUTO-SCROLL TARGET WHEN FILE DROPPED) */}
+          {/* ================================================================ */}
+          <div ref={toolsSectionRef} className="pt-4 scroll-mt-20 space-y-4">
+            {/* Compact Active File Pill right above the main tools when a file is dropped */}
+            {droppedFiles.length > 0 && (
+              <div className="mx-auto max-w-2xl flex flex-wrap items-center justify-between gap-3 rounded-2xl border-2 border-emerald-500/80 bg-emerald-50/90 dark:bg-emerald-950/40 px-4 py-3 text-left shadow-md">
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <CheckCircle2 className="h-5 w-5 shrink-0 text-emerald-600 dark:text-emerald-400" />
+                  <div className="min-w-0">
+                    <p className="text-xs sm:text-sm font-extrabold text-slate-900 dark:text-white truncate">
+                      {droppedFiles[0].name}
+                      {droppedFiles.length > 1 && ` (+${droppedFiles.length - 1} more)`}
+                      <span className="ml-2 font-mono text-[11px] font-normal text-slate-500">
+                        ({formatFileSize(droppedFiles.reduce((a, f) => a + f.size, 0))})
+                      </span>
+                    </p>
+                    <p className="text-[11px] font-semibold text-emerald-700 dark:text-emerald-300">
+                      File ready! Click any tool below to open it directly:
+                    </p>
                   </div>
                 </div>
 
-                <div>
-                  <p className="text-[11px] font-extrabold uppercase tracking-wider text-rose-600 dark:text-rose-400 mb-3 flex items-center gap-1.5">
-                    <Sparkles className="h-3.5 w-3.5" />
-                    <span>Select a PDF Tool to Open Your File Immediately:</span>
-                  </p>
-
-                  <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2.5">
-                    {toolsDirectory.map((tool) => {
-                      const Icon = tool.icon;
-                      return (
-                        <button
-                          key={tool.id}
-                          type="button"
-                          onClick={() => handleLaunchToolWithFile(tool.href)}
-                          className="group flex items-center justify-between gap-3 rounded-2xl border border-slate-200/90 bg-slate-50/70 hover:bg-white hover:border-rose-500 hover:shadow-md p-3 text-left transition-all dark:border-slate-800 dark:bg-slate-800/50 dark:hover:bg-slate-800 dark:hover:border-rose-500 cursor-pointer"
-                        >
-                          <div className="flex items-center gap-2.5 min-w-0">
-                            <div
-                              className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border ${tool.iconBg} ${tool.iconColor} group-hover:scale-105 transition-transform`}
-                            >
-                              <Icon className="h-4 w-4" />
-                            </div>
-                            <div className="min-w-0">
-                              <p className="text-xs font-bold text-slate-900 dark:text-white group-hover:text-rose-600 truncate">
-                                {tool.title}
-                              </p>
-                              <p className="text-[10px] text-slate-500 dark:text-slate-400 truncate">
-                                Open directly →
-                              </p>
-                            </div>
-                          </div>
-                          <ArrowRight className="h-3.5 w-3.5 shrink-0 text-slate-400 group-hover:text-rose-600 group-hover:translate-x-0.5 transition-transform" />
-                        </button>
-                      );
-                    })}
-                  </div>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => heroFileInputRef.current?.click()}
+                    className="rounded-lg border border-emerald-300 bg-white px-2.5 py-1 text-xs font-bold text-emerald-800 hover:bg-emerald-100"
+                  >
+                    Change
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setDroppedFiles([]);
+                      if (typeof window !== "undefined") {
+                        window.__pdfStudioPendingFiles = null;
+                      }
+                    }}
+                    className="rounded-lg border border-emerald-200 bg-white p-1 text-slate-500 hover:text-red-600"
+                    title="Clear file"
+                  >
+                    <X className="h-4 w-4" />
+                  </button>
                 </div>
               </div>
             )}
+
+            <div className="flex flex-wrap items-center justify-center gap-2">
+              <button
+                type="button"
+                onClick={() => setActiveCategory("all")}
+                className={`rounded-full px-3.5 py-1.5 text-xs font-semibold transition-all ${
+                  activeCategory === "all"
+                    ? "bg-rose-600 text-white shadow-xs"
+                    : "bg-slate-100 text-slate-600 hover:bg-slate-200 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800"
+                }`}
+              >
+                {t.filters.all} ({toolsDirectory.length})
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setActiveCategory("popular")}
+                className={`rounded-full px-3.5 py-1.5 text-xs font-semibold transition-all ${
+                  activeCategory === "popular"
+                    ? "bg-rose-600 text-white shadow-xs"
+                    : "bg-slate-100 text-slate-600 hover:bg-slate-200 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800"
+                }`}
+              >
+                {t.filters.popular} (6)
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setActiveCategory("scan_edit")}
+                className={`rounded-full px-3.5 py-1.5 text-xs font-semibold transition-all ${
+                  activeCategory === "scan_edit"
+                    ? "bg-rose-600 text-white shadow-xs"
+                    : "bg-slate-100 text-slate-600 hover:bg-slate-200 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800"
+                }`}
+              >
+                {t.filters.scan_edit} (5)
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setActiveCategory("organize")}
+                className={`rounded-full px-3.5 py-1.5 text-xs font-semibold transition-all ${
+                  activeCategory === "organize"
+                    ? "bg-rose-600 text-white shadow-xs"
+                    : "bg-slate-100 text-slate-600 hover:bg-slate-200 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800"
+                }`}
+              >
+                {t.filters.organize} (4)
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setActiveCategory("convert")}
+                className={`rounded-full px-3.5 py-1.5 text-xs font-semibold transition-all ${
+                  activeCategory === "convert"
+                    ? "bg-rose-600 text-white shadow-xs"
+                    : "bg-slate-100 text-slate-600 hover:bg-slate-200 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800"
+                }`}
+              >
+                {t.filters.convert} (3)
+              </button>
+            </div>
           </div>
-
-          <div className="flex flex-wrap items-center justify-center gap-2 pt-3">
-            <button
-              type="button"
-              onClick={() => setActiveCategory("all")}
-              className={`rounded-full px-3.5 py-1.5 text-xs font-semibold transition-all ${
-                activeCategory === "all"
-                  ? "bg-rose-600 text-white shadow-xs"
-                  : "bg-slate-100 text-slate-600 hover:bg-slate-200 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800"
-              }`}
-            >
-              {t.filters.all} ({toolsDirectory.length})
-            </button>
-
-            <button
-              type="button"
-              onClick={() => setActiveCategory("popular")}
-              className={`rounded-full px-3.5 py-1.5 text-xs font-semibold transition-all ${
-                activeCategory === "popular"
-                  ? "bg-rose-600 text-white shadow-xs"
-                  : "bg-slate-100 text-slate-600 hover:bg-slate-200 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800"
-              }`}
-            >
-              {t.filters.popular} (6)
-            </button>
-
-            <button
-              type="button"
-              onClick={() => setActiveCategory("scan_edit")}
-              className={`rounded-full px-3.5 py-1.5 text-xs font-semibold transition-all ${
-                activeCategory === "scan_edit"
-                  ? "bg-rose-600 text-white shadow-xs"
-                  : "bg-slate-100 text-slate-600 hover:bg-slate-200 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800"
-              }`}
-            >
-              {t.filters.scan_edit} (5)
-            </button>
-
-            <button
-              type="button"
-              onClick={() => setActiveCategory("organize")}
-              className={`rounded-full px-3.5 py-1.5 text-xs font-semibold transition-all ${
-                activeCategory === "organize"
-                  ? "bg-rose-600 text-white shadow-xs"
-                  : "bg-slate-100 text-slate-600 hover:bg-slate-200 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800"
-              }`}
-            >
-              {t.filters.organize} (4)
-            </button>
-
-            <button
-              type="button"
-              onClick={() => setActiveCategory("convert")}
-              className={`rounded-full px-3.5 py-1.5 text-xs font-semibold transition-all ${
-                activeCategory === "convert"
-                  ? "bg-rose-600 text-white shadow-xs"
-                  : "bg-slate-100 text-slate-600 hover:bg-slate-200 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800"
-              }`}
-            >
-              {t.filters.convert} (3)
-            </button>
-          </div>
-        </div>
-
-        {/* Ad Placement */}
-        <div className="my-10">
-          <AdBanner format="leaderboard" />
         </div>
 
         {/* Tool Cards Responsive Grid */}
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4">
+        <div className="mt-8 grid grid-cols-1 gap-4 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4">
           {filteredTools.map((tool) => {
             const Icon = tool.icon;
             return (
@@ -884,7 +834,11 @@ export default function HomePage() {
                     window.__pdfStudioPendingFiles = droppedFiles;
                   }
                 }}
-                className="group relative flex flex-col justify-between rounded-2xl border border-slate-200/90 bg-white p-5 shadow-xs transition-all duration-200 hover:-translate-y-1 hover:border-slate-300 hover:shadow-md dark:border-slate-800/80 dark:bg-slate-900/60 dark:hover:border-slate-700"
+                className={`group relative flex flex-col justify-between rounded-2xl border bg-white p-5 shadow-xs transition-all duration-200 hover:-translate-y-1 hover:shadow-md dark:bg-slate-900/60 ${
+                  droppedFiles.length > 0
+                    ? "border-rose-300 ring-2 ring-rose-500/15 hover:border-rose-500 dark:border-rose-800"
+                    : "border-slate-200/90 hover:border-slate-300 dark:border-slate-800/80 dark:hover:border-slate-700"
+                }`}
               >
                 <div>
                   <div className="flex items-start justify-between mb-3.5">
@@ -894,11 +848,17 @@ export default function HomePage() {
                       <Icon className="h-5 w-5" />
                     </div>
 
-                    {tool.popular && (
-                      <span className="inline-flex items-center gap-1 rounded-full bg-gradient-to-r from-amber-500 via-orange-500 to-rose-500 px-2.5 py-0.5 text-[10px] font-extrabold uppercase tracking-wider text-white shadow-xs shadow-orange-500/20">
-                        <Sparkles className="h-2.5 w-2.5" />
-                        <span>Popular</span>
+                    {droppedFiles.length > 0 ? (
+                      <span className="inline-flex items-center gap-1 rounded-full bg-emerald-600 px-2.5 py-0.5 text-[10px] font-extrabold uppercase tracking-wider text-white shadow-xs">
+                        <span>Open File →</span>
                       </span>
+                    ) : (
+                      tool.popular && (
+                        <span className="inline-flex items-center gap-1 rounded-full bg-gradient-to-r from-amber-500 via-orange-500 to-rose-500 px-2.5 py-0.5 text-[10px] font-extrabold uppercase tracking-wider text-white shadow-xs shadow-orange-500/20">
+                          <Sparkles className="h-2.5 w-2.5" />
+                          <span>Popular</span>
+                        </span>
+                      )
                     )}
                   </div>
 
@@ -931,6 +891,11 @@ export default function HomePage() {
               </Link>
             );
           })}
+        </div>
+
+        {/* Ad Placement */}
+        <div className="my-10">
+          <AdBanner format="leaderboard" />
         </div>
 
         {/* TRUST SECTION */}
